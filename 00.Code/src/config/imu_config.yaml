@@ -2,7 +2,7 @@
 # 注意: imu设备的输出波特率应与ROS2驱动设置的波特率保持一致
 IMU_publisher:
     ros__parameters:
-        serial_port: "/dev/ttyUSB0"
+        serial_port: "/dev/ttyUSB1"
         baud_rate: 921600
         frame_id: "base_link"
         imu_topic1: "/imu_data1"
