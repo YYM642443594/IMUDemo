@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <thread>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -13,6 +14,7 @@
 #include "zhixiang_imu_ros2/msg/imu_data1.hpp"
 #include "zhixiang_imu_ros2/msg/imu_data2.hpp"
 #include "zhixiang_imu_ros2/msg/imu_data3.hpp"
+#include "zhixiang_imu_ros2/srv/set_push.hpp"
 #include "serial_parse.h"
 
 #define BUF_SIZE (1024)
@@ -23,6 +25,8 @@ std::string frame_id;
 std::string imu_topic1;
 std::string imu_topic2;
 std::string imu_topic3;
+
+using SetPush = zhixiang_imu_ros2::srv::SetPush;
 
 zhixiang_imu_ros2::msg::ImuData1 imu1_msg;
 zhixiang_imu_ros2::msg::ImuData2 imu2_msg;
@@ -71,13 +75,80 @@ public:
 
         configure_low_latency(fd);
 
-        while (rclcpp::ok())
-            imu_read();
+        /* 推送开关控制服务: 开启/关闭传感器数据1/2/3等报文推送(0x00 0x11指令) */
+        set_push_srv = this->create_service<SetPush>(
+            "imu_set_push",
+            [this](const std::shared_ptr<SetPush::Request> req,
+                   std::shared_ptr<SetPush::Response> res)
+            {
+                res->success = send_push_ctrl(req->data_id, req->enable, req->save_to_flash);
+            });
+        RCLCPP_INFO(this->get_logger(),
+                    "Service [imu_set_push] ready, usage: "
+                    "ros2 service call /imu_set_push zhixiang_imu_ros2/srv/SetPush "
+                    "\"{data_id: 1, enable: true, save_to_flash: false}\" "
+                    "(data_id: 0x01=DATA1 0x10=DATA2 0x13=DATA3 0x02=DEV_STATUS)");
+
+        /* 串口读取线程 */
+        read_thread = std::thread([this]()
+                                  {
+            while (rclcpp::ok())
+                imu_read(); });
+    }
+
+    ~IMUPublisher()
+    {
+        if (read_thread.joinable())
+            read_thread.join();
     }
 
 private:
     int fd = 0;
     uint8_t buf[BUF_SIZE] = {0};
+    std::thread read_thread;
+    rclcpp::Service<SetPush>::SharedPtr set_push_srv;
+
+    /**
+     * 发送推送报文ID控制指令(0x00 0x11), 见协议3.2.3.7
+     * 帧格式: AA 55 00 11 Op 0C 00 CMD ID 开关 CRC16(小端)
+     * 仅支持通用CMD(0x00)下的报文ID: 0x01/0x02/0x10/0x13
+     */
+    bool send_push_ctrl(uint8_t data_id, bool enable, bool flash)
+    {
+        if (fd < 0)
+            return false;
+
+        if (data_id != IMU_MSGID_DATA1 && data_id != IMU_MSGID_DEV_STATUS &&
+            data_id != IMU_MSGID_DATA2 && data_id != IMU_MSGID_DATA3)
+        {
+            RCLCPP_WARN(this->get_logger(), "Unsupported push msg id: 0x%02X", data_id);
+            return false;
+        }
+
+        uint8_t frame[12];
+        frame[0] = IMU_FRAME_HEAD1;
+        frame[1] = IMU_FRAME_HEAD2;
+        frame[2] = IMU_CMD_GENERAL;
+        frame[3] = IMU_MSGID_PUSH_CTRL;
+        frame[4] = flash ? IMU_OP_FLASH : IMU_OP_RAM;
+        frame[5] = 0x0C; /* 整帧长度12字节, 小端 */
+        frame[6] = 0x00;
+        frame[7] = IMU_CMD_GENERAL; /* 目标报文CMD */
+        frame[8] = data_id;         /* 目标报文ID */
+        frame[9] = enable ? 0x01 : 0x00;
+        uint16_t crc = crc16_value_cal(frame, 10);
+        frame[10] = crc & 0xFF;
+        frame[11] = crc >> 8;
+
+        int n = write(fd, frame, sizeof(frame));
+        RCLCPP_INFO(this->get_logger(),
+                    "Send push ctrl: msg=0x%02X %s(%s) [%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+                    data_id, enable ? "ON" : "OFF", flash ? "FLASH" : "RAM",
+                    frame[0], frame[1], frame[2], frame[3], frame[4],
+                    frame[5], frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]);
+
+        return n == (int)sizeof(frame);
+    }
 
     void imu_read(void)
     {
@@ -172,11 +243,11 @@ private:
             return -1;
         }
 
-        options.c_cflag &= ~PARENB;  /* 无校验 */
-        options.c_cflag &= ~CSTOPB;  /* 1位停止位 */
+        options.c_cflag &= ~PARENB; /* 无校验 */
+        options.c_cflag &= ~CSTOPB; /* 1位停止位 */
         options.c_cflag &= ~CSIZE;
         options.c_cflag |= HUPCL;
-        options.c_cflag |= CS8;      /* 8位数据位 */
+        options.c_cflag |= CS8; /* 8位数据位 */
         options.c_cflag &= ~CRTSCTS;
         options.c_cflag |= CREAD | CLOCAL;
 

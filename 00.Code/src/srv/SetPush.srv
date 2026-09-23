@@ -1,0 +1,6 @@
+# 推送报文ID控制指令(0x00 0x11), 见协议3.2.3.7
+uint8 data_id       # 目标报文ID: 0x01传感器数据1 0x02设备状态 0x10传感器数据2 0x13传感器数据3
+bool enable         # true:开启推送 false:关闭推送
+bool save_to_flash  # true:配置到FLASH(掉电保存) false:仅配置到RAM(掉电不保存)
+---
+bool success        # true:指令已成功写入串口

@@ -26,6 +26,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ImuData1.msg"
   "msg/ImuData2.msg"
   "msg/ImuData3.msg"
+  "srv/SetPush.srv"
   DEPENDENCIES std_msgs builtin_interfaces
 )
 
