@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>zhixiang_imu_ros2</name>
+  <version>0.0.1</version>
+  <description>Zhixiang IMU private serial protocol driver for ROS2, parses sensor push data 1/2/3 (0x0001/0x0010/0x0013)</description>
+  <maintainer email="dev@todo.todo">dev</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>builtin_interfaces</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
