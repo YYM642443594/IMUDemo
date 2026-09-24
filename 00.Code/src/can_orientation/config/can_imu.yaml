@@ -1,0 +1,6 @@
+can_orientation_node:
+  ros__parameters:
+    can_interface: "can0"          # SocketCAN接口名
+    frame_id: "base_link"          # 消息坐标系
+    imu_topic: "imu/data"          # sensor_msgs/Imu话题
+    can_data_topic: "/can_imu_data"  # CanImuData全字段话题(协议原始单位)
