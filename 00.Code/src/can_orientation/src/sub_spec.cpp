@@ -74,10 +74,10 @@ int main(int argc, char *argv[])
     nh->get_parameter("can_data_topic", can_data_topic);
     nh->get_parameter("imu_topic", imu_topic);
 
-    auto sub1 = nh->create_subscription<can_orientation::msg::CanImuData>(
-        can_data_topic, 10, topic_callback_data);
     auto sub2 = nh->create_subscription<sensor_msgs::msg::Imu>(
         imu_topic, 10, topic_callback_imu);
+    auto sub1 = nh->create_subscription<can_orientation::msg::CanImuData>(
+        can_data_topic, 10, topic_callback_data);
 
     rclcpp::spin(nh);
     rclcpp::shutdown();
