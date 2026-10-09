@@ -15,7 +15,8 @@
 - `SocketCAN`驱动：内核级接收过滤器，只接收`0x91`~`0x98`报文
 - 协议支持：`0x091`~`0x098`共8个数据报文解析
 - 报文收集：8帧收齐后打印一次完整IMU数据，容忍报文乱序
-- 多线程设计：CAN接收解析线程 + 主线程
+- 多线程设计：CAN接收线程 + 协议解析线程
+- 帧级队列：`can_frame`环形队列（单生产者单消费者）衔接两个线程，打印不阻塞接收
 - 十进制输出：解析数据以十进制格式打印
 
 
@@ -26,9 +27,23 @@
 00.Code/
 ├── main.c                 # 主程序入口，线程管理
 ├── drv_socketcan.c/h      # SocketCAN驱动模块
+├── bsp_can_queue.c/h      # CAN帧级环形队列模块
 ├── bsp_can_protocol.c/h   # CAN协议解析模块
 └── Readme.md              # 项目说明文档
 ```
+
+### 线程模型
+
+```
+CAN接收线程                 协议解析线程
+(收帧入队)                  (出队解析打印)
+     |                            ^
+     v                            |
+  [BspCanQueue帧级环形队列] -------+
+```
+
+与串口Demo的对应关系：串口是字节流，队列为字节缓存，解析线程需要帧头状态机组包；
+CAN面向报文，`read()`返回完整帧，队列为`can_frame`缓存，出队即完整帧。
 
 
 
@@ -69,7 +84,7 @@ cd /path/to/IMUDemo/00.Code
 ### 编译命令
 
 ```bash
-gcc -o can_demo main.c drv_socketcan.c bsp_can_protocol.c -lpthread
+gcc -o can_demo main.c drv_socketcan.c bsp_can_queue.c bsp_can_protocol.c -lpthread
 ```
 
 ### 编译验证
