@@ -16,10 +16,10 @@ void topic_callback_data(const can_orientation::msg::CanImuData::SharedPtr msg)
 {
     cout << "[CanImuData]" << "\n";
     cout << "\theader:" << "\n";
-    cout << "\t\tstamp:" << "\n";
-    cout << "\t\t  secs:" << msg->header.stamp.sec << "\n";
-    cout << "\t\t  nanosecs:" << msg->header.stamp.nanosec << "\n";
-    cout << "\t\tframe_id:" << msg->header.frame_id << "\n";
+    cout << "\tstamp:" << "\n";
+    cout << "\tsecs:" << msg->header.stamp.sec << "\n";
+    cout << "\tnanosecs:" << msg->header.stamp.nanosec << "\n";
+    cout << "\tframe_id:" << msg->header.frame_id << "\n";
     cout << "\ttimestamp: " << msg->timestamp_us << "us" << "\n";
     cout << "\tacc_x: " << fixed << setprecision(6) << msg->acc[0] << "\n";
     cout << "\tacc_y: " << fixed << setprecision(6) << msg->acc[1] << "\n";
@@ -45,10 +45,10 @@ void topic_callback_imu(const sensor_msgs::msg::Imu::SharedPtr msg)
 {
     cout << "[Imu]" << "\n";
     cout << "\theader:" << "\n";
-    cout << "\t\tstamp:" << "\n";
-    cout << "\t\t  secs:" << msg->header.stamp.sec << "\n";
-    cout << "\t\t  nanosecs:" << msg->header.stamp.nanosec << "\n";
-    cout << "\t\tframe_id:" << msg->header.frame_id << "\n";
+    cout << "\tstamp:" << "\n";
+    cout << "\tsecs:" << msg->header.stamp.sec << "\n";
+    cout << "\tnanosecs:" << msg->header.stamp.nanosec << "\n";
+    cout << "\tframe_id:" << msg->header.frame_id << "\n";
     cout << "\torientation w: " << fixed << setprecision(6) << msg->orientation.w << "\n";
     cout << "\torientation x: " << fixed << setprecision(6) << msg->orientation.x << "\n";
     cout << "\torientation y: " << fixed << setprecision(6) << msg->orientation.y << "\n";
