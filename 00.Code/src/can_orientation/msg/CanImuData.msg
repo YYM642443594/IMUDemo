@@ -1,4 +1,5 @@
 # CAN标准帧 0x091~0x098 解析结果 (用户协议 3.3.2 CAN输出标准帧格式)
+std_msgs/Header header   # 坐标系与时间戳
 uint64 timestamp_us      # 时间戳 (us), CAN ID 0x091
 float64 roll             # 横滚角 (deg), 0x092
 float64 pitch            # 俯仰角 (deg), 0x092

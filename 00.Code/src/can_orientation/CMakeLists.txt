@@ -8,14 +8,16 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CanImuData.msg"
+  DEPENDENCIES std_msgs
 )
 
 add_executable(can_orientation_node src/ahrs.cpp)
-ament_target_dependencies(can_orientation_node rclcpp sensor_msgs)
+ament_target_dependencies(can_orientation_node rclcpp sensor_msgs std_msgs)
 
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} rosidl_typesupport_cpp)
 target_link_libraries(can_orientation_node "${cpp_typesupport_target}")
