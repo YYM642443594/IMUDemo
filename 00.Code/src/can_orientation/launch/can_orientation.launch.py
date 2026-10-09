@@ -17,4 +17,11 @@ def generate_launch_description():
             output='screen',
             parameters=[config],
         ),
+        Node(
+            package='can_orientation',
+            executable='can_imu_listener',
+            name='can_imu_listener',
+            output='screen',
+            parameters=[config],
+        ),
     ])

@@ -19,10 +19,14 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 add_executable(can_orientation_node src/ahrs.cpp)
 ament_target_dependencies(can_orientation_node rclcpp sensor_msgs std_msgs)
 
+add_executable(can_imu_listener src/sub_spec.cpp)
+ament_target_dependencies(can_imu_listener rclcpp sensor_msgs std_msgs)
+
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} rosidl_typesupport_cpp)
 target_link_libraries(can_orientation_node "${cpp_typesupport_target}")
+target_link_libraries(can_imu_listener "${cpp_typesupport_target}")
 
-install(TARGETS can_orientation_node
+install(TARGETS can_orientation_node can_imu_listener
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config
