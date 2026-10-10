@@ -1,11 +1,17 @@
 /**
  * @file drv_socketcan.c
  * @author 杨镒铭 (642443594@qq.com)
- * @brief Linux SocketCAN驱动
+ * @brief Linux SocketCAN驱动(套接字的打开/收发/关闭)
  * @version V1.0.0
  * @date 2026-10-09
  *
  * @copyright Copyright (c) 2026
+ *
+ * SocketCAN编程模型与接口说明见 drv_socketcan.h 文件头。
+ *
+ * 本驱动的收发均为阻塞式:
+ *      接收线程在read()上休眠, 有帧到达才被唤醒, 空闲时不占CPU;
+ *      发送用于下发0x103等配置指令, 频率极低, 阻塞可接受。
  *
  */
 
@@ -46,9 +52,12 @@ int DrvOpenSocketCan(pDrvSocketCan_S pDrvCan, const char *ifname,
         return -1;
     }
 
+    /* 清零对象, Fd=0稍后会覆盖, 失败路径统一置-1 */
     memset(pDrvCan, 0, sizeof(DrvSocketCan_S));
 
-    /* 创建CAN原始套接字 */
+    /* 步骤1: 创建CAN原始套接字
+       PF_CAN: 协议族为CAN
+       SOCK_RAW/CAN_RAW: 原始CAN帧收发(另有广播管理BCM等协议) */
     pDrvCan->Fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
 
     if (pDrvCan->Fd < 0)
@@ -57,9 +66,11 @@ int DrvOpenSocketCan(pDrvSocketCan_S pDrvCan, const char *ifname,
         return -1;
     }
 
-    /* 通过接口名获取接口索引 */
+    /* 步骤2: 通过接口名获取接口索引
+       bind()不使用接口名而是内核分配的数字索引,
+       典型失败原因: 接口不存在(未插USB转CAN或驱动未加载) */
     strncpy(IfReq.ifr_name, ifname, IFNAMSIZ - 1);
-    IfReq.ifr_name[IFNAMSIZ - 1] = '\0';
+    IfReq.ifr_name[IFNAMSIZ - 1] = '\0'; /* 保证字符串以\0结尾 */
 
     if (ioctl(pDrvCan->Fd, SIOCGIFINDEX, &IfReq) < 0)
     {
@@ -72,7 +83,8 @@ int DrvOpenSocketCan(pDrvSocketCan_S pDrvCan, const char *ifname,
         return -1;
     }
 
-    /* 绑定到指定CAN接口 */
+    /* 步骤3: 绑定到指定CAN接口
+       绑定后只收发该接口(can0)上的帧, 其他接口(如can1)不受影响 */
     memset(&Addr, 0, sizeof(struct sockaddr_can));
     Addr.can_family = AF_CAN;
     Addr.can_ifindex = IfReq.ifr_ifindex;
@@ -88,7 +100,10 @@ int DrvOpenSocketCan(pDrvSocketCan_S pDrvCan, const char *ifname,
         return -1;
     }
 
-    /* 设置内核层接收过滤器(只收指定ID的帧, 减少无效唤醒) */
+    /* 步骤4: 设置内核层接收过滤器(只收指定ID的帧, 减少无效唤醒)
+       过滤在内核完成: 不匹配的帧不会拷贝到用户态缓冲区,
+       高总线负载下可显著降低本进程的CPU占用。
+       过滤器设置失败仅告警不终止: 退化为收所有帧, 功能仍可用 */
     if ((pFilter != NULL) && (FilterNum > 0))
     {
         if (setsockopt(pDrvCan->Fd, SOL_CAN_RAW, CAN_RAW_FILTER,
@@ -98,6 +113,7 @@ int DrvOpenSocketCan(pDrvSocketCan_S pDrvCan, const char *ifname,
         }
     }
 
+    /* 记录接口名, 便于调试打印 */
     strncpy(pDrvCan->IfName, ifname, IFNAMSIZ - 1);
     pDrvCan->IfName[IFNAMSIZ - 1] = '\0';
 
@@ -120,7 +136,7 @@ void DrvCloseSocketCan(pDrvSocketCan_S pDrvCan)
     {
         close(pDrvCan->Fd);
 
-        pDrvCan->Fd = -1;
+        pDrvCan->Fd = -1; /* 标记为未打开, 防止重复关闭 */
     }
 }
 
@@ -140,6 +156,8 @@ int DrvSocketCanSend(pDrvSocketCan_S pDrvCan, struct can_frame *pFrame)
         return -1;
     }
 
+    /* 一次write()发送一个完整CAN帧(16字节:
+       ID+DLC+数据+填充, 由struct can_frame定义) */
     Ret = write(pDrvCan->Fd, pFrame, sizeof(struct can_frame));
 
     if (Ret != sizeof(struct can_frame))
@@ -170,10 +188,13 @@ int DrvSocketCanRecv(pDrvSocketCan_S pDrvCan, struct can_frame *pFrame)
         return -1;
     }
 
+    /* 阻塞式读取: 无帧时线程在内核休眠, 有帧才返回 */
     Ret = read(pDrvCan->Fd, pFrame, sizeof(struct can_frame));
 
     if (Ret < 0)
     {
+        /* EAGAIN: 套接字为阻塞模式时不会出现,
+           此分支兼容将来改为非阻塞(O_NONBLOCK)模式 */
         if (errno == EAGAIN)
         {
             return 0;
@@ -184,6 +205,7 @@ int DrvSocketCanRecv(pDrvSocketCan_S pDrvCan, struct can_frame *pFrame)
         return -1;
     }
 
+    /* 读到的字节数不足一个完整帧: 按协议不应出现, 保守忽略 */
     if (Ret < (int)sizeof(struct can_frame))
     {
         return 0;
