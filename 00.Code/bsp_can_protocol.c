@@ -66,6 +66,24 @@ static unsigned long long CanGetU64LE(const unsigned char *pBuf)
 =                       外部接口
 ===========================================================*/
 
+int BspCanProtocolMakeStreamEnableFrame(struct can_frame *pFrame)
+{
+    if (pFrame == NULL)
+    {
+        return -1;
+    }
+
+    memset(pFrame, 0, sizeof(struct can_frame));
+
+    pFrame->can_id = CAN_CMD_ID_STREAM;
+    pFrame->len    = CAN_DATA_FRAME_DLC;
+
+    pFrame->data[0] = 0x01; /* 操作符: 写RAM(掉电不保存), 0x02=写FLASH */
+    pFrame->data[1] = 0x01; /* 开启当前数据流 */
+
+    return 0;
+}
+
 unsigned int BspCanProtocolMakeFilter(struct can_filter *pFilter)
 {
     unsigned int i;

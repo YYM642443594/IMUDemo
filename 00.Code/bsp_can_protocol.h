@@ -29,10 +29,13 @@ extern "C"
 #include <linux/can.h>
 
     /* ================= 配置 ================= */
-#define CAN_DATA_ID_BASE 0x091              /* 数据报文起始ID */
-#define CAN_DATA_ID_END 0x098               /* 数据报文结束ID */
-#define CAN_DATA_FRAME_NUM (0x098 - 0x091 + 1) /* 数据报文帧数 */
-#define CAN_DATA_FRAME_DLC 8                /* 数据报文每帧字节数 */
+    #define CAN_DATA_ID_BASE 0x091              /* 数据报文起始ID */
+    #define CAN_DATA_ID_END 0x098               /* 数据报文结束ID */
+    #define CAN_DATA_FRAME_NUM (0x098 - 0x091 + 1) /* 数据报文帧数 */
+    #define CAN_DATA_FRAME_DLC 8                /* 数据报文每帧字节数 */
+
+    /* CAN交互指令ID(见协议文档3.3.3章节) */
+    #define CAN_CMD_ID_STREAM 0x103 /* CAN数据流输出状态设置与查询 */
 
     /* IMU数据集合(一帧完整数据 = 8个CAN报文) */
     typedef struct
@@ -53,6 +56,19 @@ extern "C"
      * @return unsigned int 过滤器数量
      */
     unsigned int BspCanProtocolMakeFilter(struct can_filter *pFilter);
+
+    /**
+     * @brief 生成"开启CAN数据流推送"指令帧(ID 0x103)
+     *
+     * 用于程序启动时主动开启设备CAN推送:
+     * 设备未开启时生效; 已开启时重复下发无副作用。
+     * data[0]=0x01 写RAM(掉电不保存), 如需掉电保存改为0x02写FLASH
+     * data[1]=0x01 开启当前数据流
+     *
+     * @param pFrame 指令帧(输出)
+     * @return int 0成功 -1参数错误
+     */
+    int BspCanProtocolMakeStreamEnableFrame(struct can_frame *pFrame);
 
     /**
      * @brief CAN帧解析入口

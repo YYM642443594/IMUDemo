@@ -149,6 +149,22 @@ int main(int argc, char *argv[])
 
     printf("Open SocketCAN Success\r\n");
 
+    /* 主动下发"开启CAN数据推送"指令(0x103)
+       设备未开启推送时生效; 已开启时重复下发无副作用 */
+    {
+        struct can_frame CmdFrame;
+
+        if ((BspCanProtocolMakeStreamEnableFrame(&CmdFrame) == 0) &&
+            (DrvSocketCanSend(&G_DrvCan, &CmdFrame) == 0))
+        {
+            printf("Send StreamEnable Cmd(0x103) OK\r\n");
+        }
+        else
+        {
+            printf("Send StreamEnable Cmd(0x103) Fail\r\n");
+        }
+    }
+
     /* 创建接收线程 */
     if (pthread_create(&RecvThread, NULL, CanRecvThread, NULL) != 0)
     {
