@@ -65,9 +65,9 @@
 #include <pthread.h>
 #include <stdint.h>
 
-#include "drv_socketcan.h"     /* SocketCAN驱动层: 打开/收发/关闭 */
-#include "bsp_can_queue.h"     /* 帧级环形队列: 衔接收发两个线程 */
-#include "bsp_can_protocol.h"  /* 协议层: 过滤器生成/推送开关指令/报文解析 */
+#include "drv_socketcan.h"    /* SocketCAN驱动层: 打开/收发/关闭 */
+#include "bsp_can_queue.h"    /* 帧级环形队列: 衔接收发两个线程 */
+#include "bsp_can_protocol.h" /* 协议层: 过滤器生成/推送开关指令/报文解析 */
 
 /* ================= 全局变量 ================= */
 
@@ -87,7 +87,7 @@ static DrvSocketCan_S G_DrvCan;
 static BspCanQueue_S G_CanQueue;
 
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.1.0";
+static const char *G_Version = "V1.0.0.0";
 
 /*===========================================================
 =                       CAN接收线程
