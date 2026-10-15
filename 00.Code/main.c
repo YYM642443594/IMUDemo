@@ -58,8 +58,10 @@
  *       sudo ip link set can0 type can bitrate 1000000
  *       sudo ip link set can0 up
  *
- *   程序启动时会自动下发0x103指令开启IMU的CAN数据推送,
- *   无需再通过串口AT指令(AT+DATALINK=CAN,1)手动开启。
+ *   程序启动时自动下发0x103指令开启IMU的CAN数据推送,
+ *   运行期间每3秒重发一次(重复下发无副作用):
+ *   设备重启或推送意外关闭后可自动恢复, 无需人工干预。
+ *   若设备固件较旧不支持CAN指令, 可串口AT+DATALINK=CAN,1手动开启。
  *
  *   按 Ctrl+C 退出, 退出时打印最终汇总。
  */
@@ -99,7 +101,14 @@ static BspCanQueue_S G_CanQueue;
 static volatile sig_atomic_t G_Running = 1;
 
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.1.1";
+static const char *G_Version = "V1.2.0";
+
+/** @brief 0x103开启推送指令周期重发间隔(秒)
+ *  协议规定重复下发无副作用, 用于设备重启/推送意外关闭后自动恢复 */
+#define CMD_RESEND_IV_SEC 3.0
+
+/** @brief 0x103指令累计下发次数(含启动首次) */
+static unsigned long long G_CmdSentCount = 0;
 
 /** @brief 程序启动时刻(单调钟), 统计表头已运行时长用 */
 static double G_StartSec;
@@ -284,6 +293,8 @@ int main(int argc, char *argv[])
             (DrvSocketCanSend(&G_DrvCan, &CmdFrame) == 0))
         {
             printf("Send StreamEnable Cmd(0x103) OK\r\n");
+
+            G_CmdSentCount = 1;
         }
         else
         {
@@ -319,6 +330,8 @@ int main(int argc, char *argv[])
 
         double PrintIv = Tty ? 1.0 : 5.0;
 
+        double LastCmdSec = G_StartSec; /* 上次下发0x103时刻 */
+
         int FirstPrint = 1;
 
         while (G_Running)
@@ -330,6 +343,21 @@ int main(int argc, char *argv[])
             usleep(20000); /* 20ms粒度轮询, CPU占用可忽略 */
 
             Now = NowSec();
+
+            /* 周期重发0x103开启推送指令:
+               已开启时无副作用, 设备重启或推送被关后由此自动恢复 */
+            if (Now - LastCmdSec >= CMD_RESEND_IV_SEC)
+            {
+                struct can_frame CmdFrame;
+
+                if ((BspCanProtocolMakeStreamEnableFrame(&CmdFrame) == 0) &&
+                    (DrvSocketCanSend(&G_DrvCan, &CmdFrame) == 0))
+                {
+                    G_CmdSentCount++;
+                }
+
+                LastCmdSec = Now;
+            }
 
             /* 到达打印间隔: 刷新统计表格(终端下原地重绘) */
             if (Now - LastPrint >= PrintIv)
@@ -412,6 +440,9 @@ int main(int argc, char *argv[])
         }
 
         printf("队列丢弃帧: %u\r\n", G_CanQueue.DropCount);
+
+        printf("0x103开启推送指令下发: %llu 次 (运行中每%.0fs重发)\r\n",
+               G_CmdSentCount, CMD_RESEND_IV_SEC);
     }
 
     DrvCloseSocketCan(&G_DrvCan);
