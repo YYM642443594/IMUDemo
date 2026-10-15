@@ -11,8 +11,11 @@
  * 在 LinuxCanDemo 解析功能基础上增加帧级统计:
  *   - 每个ID的帧数 / 平均Hz / 瞬时Hz
  *   - 帧间隔: 当前ms(当前帧-上一帧) / 平均 / 最小 / 最大
+ *   - 0x091设备时间戳差值Δt: 统计 + 最近64包实时曲线
  *   - 各ID最新一帧按协议(小端intel)解析展示
- * 终端下每秒原地刷新; 8帧收齐同时解析出一组完整IMU数据。
+ * 终端下每秒原地刷新统计数据与解析值。
+ * (8帧收齐的完整数据整版打印默认不输出, 实时解析区已逐ID展示,
+ *  BspCanProtocolPrintImuData()保留供调试按需调用)
  *
  * ****************************** 软件架构 ******************************
  *
@@ -95,11 +98,8 @@ static BspCanQueue_S G_CanQueue;
 /** @brief 运行标志: SIGINT/SIGTERM置0, 三个线程据此退出 */
 static volatile sig_atomic_t G_Running = 1;
 
-/** @brief 8帧收齐标志(解析线程置位, 主线程打印后清零) */
-static volatile int G_ImuDataReady = 0;
-
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.1.0";
+static const char *G_Version = "V1.1.1";
 
 /** @brief 程序启动时刻(单调钟), 统计表头已运行时长用 */
 static double G_StartSec;
@@ -189,23 +189,8 @@ CanParseThread(void *arg)
         {
             /* 按协议解析+统计:
                只处理0x091~0x098且DLC=8的报文,
-               内部位图Mask记录收集进度, 8帧收齐置就绪标志 */
-            if (BspCanProtocolOnFrame(&Frame))
-            {
-                if (BspCanProtocolGetStat(0)->Count > 0)
-                {
-                    /* Mask由协议模块内部维护, 这里通过
-                       8个ID帧数均>0粗判; 就绪标志交主线程打印 */
-                }
-            }
-
-            /* 8帧收齐检查: 置标志由主线程打印, 避免本线程刷屏 */
-            if ((BspCanProtocolGetStat(0)->Count > 0) &&
-                (BspCanProtocolGetStat(7)->Count > 0))
-            {
-                /* 就绪标志: 只要8个ID都出现过即认为可打印完整数据 */
-                G_ImuDataReady = 1;
-            }
+               最新帧解析值由主线程在统计表格下方逐ID展示 */
+            BspCanProtocolOnFrame(&Frame);
         }
         else
         {
@@ -336,8 +321,6 @@ int main(int argc, char *argv[])
 
         int FirstPrint = 1;
 
-        int ImuPrinted = 0;
-
         while (G_Running)
         {
             double Now = NowSec();
@@ -347,14 +330,6 @@ int main(int argc, char *argv[])
             usleep(20000); /* 20ms粒度轮询, CPU占用可忽略 */
 
             Now = NowSec();
-
-            /* 8帧收齐且未打印过: 打印一次完整IMU数据 */
-            if (G_ImuDataReady && !ImuPrinted)
-            {
-                BspCanProtocolPrintImuData();
-
-                ImuPrinted = 1;
-            }
 
             /* 到达打印间隔: 刷新统计表格(终端下原地重绘) */
             if (Now - LastPrint >= PrintIv)

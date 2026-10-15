@@ -155,7 +155,10 @@ int BspCanProtocolMakeStreamEnableFrame(struct can_frame *pFrame)
 }
 
 /**
- * @brief 打印一次完整IMU数据(8帧收齐后由上层调用)
+ * @brief 打印一次完整IMU数据(8帧收齐后的完整视图)
+ *
+ * @note 本程序默认不调用: 实时统计表格下方已有逐ID最新帧解析区,
+ *       整版打印会重复; 本接口保留供调试按需调用。
  */
 void BspCanProtocolPrintImuData(void)
 {
