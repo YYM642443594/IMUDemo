@@ -24,7 +24,7 @@
 #define ID_MIN 0x091
 #define ID_MAX 0x098
 #define NID    (ID_MAX - ID_MIN + 1)
-#define TOTAL_LINES (2 * NID + 5)  /* 终端重绘回退行数: 表格10行+空行+解析区标题/列头+8行 */
+#define TOTAL_LINES (2 * NID + 4)  /* 终端重绘回退行数: 标题1+表头1+8ID行+空行1+解析标题1+8解析行=20 */
 
 typedef struct {
     int      seen;
