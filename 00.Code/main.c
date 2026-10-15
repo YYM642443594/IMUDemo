@@ -312,6 +312,10 @@ int main(int argc, char *argv[])
     {
         double LastPrint = 0;
 
+        double PrintIv = Tty ? 1.0 : 5.0; /* 管道输出降频, 避免刷屏 */
+
+        int FirstPrint = 1;
+
         while (G_Running)
         {
             double Now = NowSec();
@@ -320,11 +324,19 @@ int main(int argc, char *argv[])
 
             Now = NowSec();
 
-            if (Now - LastPrint >= 1.0)
+            if (Now - LastPrint >= PrintIv)
             {
+                if (Tty && !FirstPrint)
+                {
+                    /* 回退到统计块首行覆盖重绘(行数固定, 见UART_STAT_PRINT_LINES) */
+                    printf("\033[%dA", UART_STAT_PRINT_LINES);
+                }
+
                 BspUartProtocolPrintStat(Now - G_StartSec, Tty);
 
                 LastPrint = Now;
+
+                FirstPrint = 0;
             }
 
             /* 限时运行: 到时退出 */

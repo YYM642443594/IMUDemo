@@ -341,92 +341,11 @@ static void StatOnFrame(int Index, double Ts)
 }
 
 /**
- * @brief 打印数据包1解析值
+ * @brief 打印一行(终端模式清行尾, 管道模式原样)
  */
-static void PrintData1(void)
+static void PrintLine(int Tty)
 {
-    printf("  数据包1: %u Hz, %04u-%02u-%02u %02u:%02u:%02u\r\n",
-           ImuData1.Freq, ImuData1.Year, ImuData1.Month, ImuData1.Day,
-           ImuData1.Hour, ImuData1.Minute, ImuData1.Second);
-
-    printf("  Acc  X/Y/Z/|A| = %.3f / %.3f / %.3f / %.3f m/s2\r\n",
-           ImuData1.Acc[0], ImuData1.Acc[1], ImuData1.Acc[2], ImuData1.Acc[3]);
-
-    printf("  Gyr  X/Y/Z/|W| = %.3f / %.3f / %.3f / %.3f deg/s\r\n",
-           ImuData1.Gyr[0], ImuData1.Gyr[1], ImuData1.Gyr[2], ImuData1.Gyr[3]);
-
-    printf("  Temp = %.2f C, RPY = %.2f / %.2f / %.2f deg\r\n",
-           ImuData1.Temp, ImuData1.Rpy[0], ImuData1.Rpy[1], ImuData1.Rpy[2]);
-
-    printf("  Quat = %.5f / %.5f / %.5f / %.5f\r\n",
-           ImuData1.Quat[0], ImuData1.Quat[1], ImuData1.Quat[2], ImuData1.Quat[3]);
-
-    printf("  Mag  X/Y/Z = %.3f / %.3f / %.3f\r\n",
-           ImuData1.Mag[0], ImuData1.Mag[1], ImuData1.Mag[2]);
-}
-
-/**
- * @brief 打印数据包2解析值
- */
-static void PrintData2(void)
-{
-    printf("  数据包2: Timestamp = %llu us (%.6f s)\r\n",
-           (unsigned long long)ImuData2.Timestamp,
-           (double)ImuData2.Timestamp / 1e6);
-
-    printf("  Acc X/Y/Z = %.3f / %.3f / %.3f m/s2\r\n",
-           ImuData2.Acc[0], ImuData2.Acc[1], ImuData2.Acc[2]);
-
-    printf("  Gyr X/Y/Z = %.3f / %.3f / %.3f deg/s\r\n",
-           ImuData2.Gyr[0], ImuData2.Gyr[1], ImuData2.Gyr[2]);
-
-    printf("  RPY = %.2f / %.2f / %.2f deg\r\n",
-           ImuData2.Rpy[0], ImuData2.Rpy[1], ImuData2.Rpy[2]);
-}
-
-/**
- * @brief 打印数据包3解析值
- */
-static void PrintData3(void)
-{
-    printf("  数据包3: %u Hz, %04u-%02u-%02u %02u:%02u:%02u\r\n",
-           ImuData3.Freq, ImuData3.Year, ImuData3.Month, ImuData3.Day,
-           ImuData3.Hour, ImuData3.Minute, ImuData3.Second);
-
-    printf("  Timestamp = %llu us, PPS %s (mode %u)\r\n",
-           (unsigned long long)ImuData3.Timestamp,
-           (ImuData3.PpsLock == 1) ? "锁定" : "失锁", ImuData3.PpsMode);
-
-    printf("  Acc  X/Y/Z/|A| = %.3f / %.3f / %.3f / %.3f m/s2\r\n",
-           ImuData3.Acc[0], ImuData3.Acc[1], ImuData3.Acc[2], ImuData3.Acc[3]);
-
-    printf("  Gyr  X/Y/Z/|W| = %.3f / %.3f / %.3f / %.3f deg/s\r\n",
-           ImuData3.Gyr[0], ImuData3.Gyr[1], ImuData3.Gyr[2], ImuData3.Gyr[3]);
-
-    printf("  Temp = %.2f C, RPY = %.2f / %.2f / %.2f deg\r\n",
-           ImuData3.Temp, ImuData3.Rpy[0], ImuData3.Rpy[1], ImuData3.Rpy[2]);
-
-    printf("  Quat = %.5f / %.5f / %.5f / %.5f\r\n",
-           ImuData3.Quat[0], ImuData3.Quat[1], ImuData3.Quat[2], ImuData3.Quat[3]);
-
-    printf("  Mag  X/Y/Z = %.3f / %.3f / %.3f\r\n",
-           ImuData3.Mag[0], ImuData3.Mag[1], ImuData3.Mag[2]);
-}
-
-/**
- * @brief 打印数据包4解析值
- */
-static void PrintData4(void)
-{
-    printf("  数据包4: Timestamp = %llu us (%.6f s)\r\n",
-           (unsigned long long)ImuData4.Timestamp,
-           (double)ImuData4.Timestamp / 1e6);
-
-    printf("  Acc X/Y/Z = %.3f / %.3f / %.3f m/s2\r\n",
-           ImuData4.Acc[0], ImuData4.Acc[1], ImuData4.Acc[2]);
-
-    printf("  Gyr X/Y/Z = %.3f / %.3f / %.3f deg/s\r\n",
-           ImuData4.Gyr[0], ImuData4.Gyr[1], ImuData4.Gyr[2]);
+    printf("%s\r\n", Tty ? "\033[K" : "");
 }
 
 /*===========================================================
@@ -666,9 +585,12 @@ const UartFrameStat_S *BspUartProtocolGetStat(unsigned int Index)
 }
 
 /**
- * @brief 打印统计表格+各包最新帧解析值
+ * @brief 打印统计表格+各包最新帧解析值(固定行数, 见UART_STAT_PRINT_LINES)
  *
- * @note 终端模式下输出行数固定, 上层配合\\033[%dA光标回退实现原地刷新
+ * @note 终端模式下总行数固定: 表头2+表格4+空行1+解析表头1+解析20行
+ *       (包1=6/包2=4/包3=7/包4=3)=28行, 上层每次打印后配合\033[28A
+ *       回退实现原地刷新; 未收到数据的包在表格行用"-"占位、解析区用
+ *       "等待数据..."占位, 保证任何时刻输出行数一致不串行
  */
 void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 {
@@ -676,71 +598,163 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
     int i;
 
-    /* ---------- 帧统计表格 ---------- */
-    printf("\r统计中: 数据包1(0x01)/2(0x10)/3(0x13)/4(0x22)  已运行 %.0fs%s\r\n",
+    /* ---------- 帧统计表格(表头2行+4行) ---------- */
+    printf("\r统计: 数据包1(0x01)/2(0x10)/3(0x13)/4(0x22)  运行 %.0fs%s\r\n",
            ElapsedSec, Tail);
 
-    printf("报文ID         帧数    平均Hz   瞬时Hz   当前ms  平均ms   最小ms   最大ms%s\r\n",
+    printf("ID    报文             帧数    平均Hz  瞬时Hz    当前ms    平均ms    最小ms    最大ms%s\r\n",
            Tail);
 
     for (i = 0; i < UART_MSG_NUM; i++)
     {
         const UartFrameStat_S *Stat = &FrameStat[i];
 
+        double Span;
+
+        double AvgHz;
+
+        double AvgIntMs;
+
         if (Stat->Count == 0)
         {
-            printf("0x%02X   %-16s 等待数据...%s\r\n",
-                   MsgDef[i].Id, MsgDef[i].Name, Tail);
+            printf("0x%02X  %-14s %7s %8s %8s %9s %9s %9s %9s%s\r\n",
+                   MsgDef[i].Id, MsgDef[i].Name,
+                   "-", "-", "-", "-", "-", "-", "-", Tail);
 
             continue;
         }
+
+        Span = Stat->LastTs - Stat->FirstTs;
+
+        AvgHz = (Span > 1e-6) ? (double)(Stat->Count - 1) / Span : 0.0;
+
+        AvgIntMs = (Stat->Count > 1) ?
+                   (Stat->SumInt / (double)(Stat->Count - 1) * 1000.0) : 0.0;
 
         if (Stat->Count == 1)
         {
-            printf("0x%02X  %llu 帧(仅1帧)%s\r\n", MsgDef[i].Id, Stat->Count, Tail);
+            printf("0x%02X  %-14s %7llu %8s %8s %9.3f %9s %9s %9s%s\r\n",
+                   MsgDef[i].Id, MsgDef[i].Name, Stat->Count,
+                   "-", "-", Stat->LastIntMs, "-", "-", "-", Tail);
 
             continue;
         }
 
-        {
-            double Span = Stat->LastTs - Stat->FirstTs;
-
-            double AvgHz = (Span > 1e-6) ? (double)(Stat->Count - 1) / Span : 0.0;
-
-            double AvgIntMs = Stat->SumInt / (double)(Stat->Count - 1) * 1000.0;
-
-            printf("0x%02X     %8llu  %8.2f %8.2f %8.3f %8.3f %8.3f %8.3f%s\r\n",
-                   MsgDef[i].Id, Stat->Count, AvgHz, Stat->InstHz,
-                   Stat->LastIntMs, AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs, Tail);
-        }
+        printf("0x%02X  %-14s %7llu %8.2f %8.2f %9.3f %9.3f %9.3f %9.3f%s\r\n",
+               MsgDef[i].Id, MsgDef[i].Name, Stat->Count, AvgHz, Stat->InstHz,
+               Stat->LastIntMs, AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs, Tail);
     }
 
-    /* ---------- 各包最新帧解析值 ---------- */
-    printf("\r\n最新帧解析(数据域已CRC校验)%s\r\n", Tail);
+    /* ---------- 各包最新帧解析值(固定行: 包1=6/包2=4/包3=7/包4=3) ---------- */
+    printf("%s\r\n", Tail);
+
+    printf("最新帧解析(数据域已CRC校验)%s\r\n", Tail);
 
     for (i = 0; i < UART_MSG_NUM; i++)
     {
         if (DataValid[i] == 0)
         {
+            /* 占位: 首行说明+剩余固定行空白, 保持总行数不变 */
+            int Pad;
+
+            int Fixed[UART_MSG_NUM] = { 6, 4, 7, 3 };
+
+            printf("  %s: 等待数据...%s\r\n", MsgDef[i].Name, Tail);
+
+            for (Pad = 1; Pad < Fixed[i]; Pad++)
+            {
+                PrintLine(Tty);
+            }
+
             continue;
         }
 
         switch (MsgDef[i].Id)
         {
             case UART_MSGID_DATA1:
-                PrintData1();
+                printf("  数据包1: %u Hz, %04u-%02u-%02u %02u:%02u:%02u%s\r\n",
+                       ImuData1.Freq, ImuData1.Year, ImuData1.Month, ImuData1.Day,
+                       ImuData1.Hour, ImuData1.Minute, ImuData1.Second, Tail);
+
+                printf("  Acc  X/Y/Z/|A| = %.3f / %.3f / %.3f / %.3f m/s2%s\r\n",
+                       ImuData1.Acc[0], ImuData1.Acc[1], ImuData1.Acc[2],
+                       ImuData1.Acc[3], Tail);
+
+                printf("  Gyr  X/Y/Z/|W| = %.3f / %.3f / %.3f / %.3f deg/s%s\r\n",
+                       ImuData1.Gyr[0], ImuData1.Gyr[1], ImuData1.Gyr[2],
+                       ImuData1.Gyr[3], Tail);
+
+                printf("  Temp = %.2f C, RPY = %.2f / %.2f / %.2f deg%s\r\n",
+                       ImuData1.Temp, ImuData1.Rpy[0], ImuData1.Rpy[1],
+                       ImuData1.Rpy[2], Tail);
+
+                printf("  Quat = %.5f / %.5f / %.5f / %.5f%s\r\n",
+                       ImuData1.Quat[0], ImuData1.Quat[1], ImuData1.Quat[2],
+                       ImuData1.Quat[3], Tail);
+
+                printf("  Mag  X/Y/Z = %.3f / %.3f / %.3f%s\r\n",
+                       ImuData1.Mag[0], ImuData1.Mag[1], ImuData1.Mag[2], Tail);
+
                 break;
 
             case UART_MSGID_DATA2:
-                PrintData2();
+                printf("  数据包2: Timestamp = %llu us (%.6f s)%s\r\n",
+                       (unsigned long long)ImuData2.Timestamp,
+                       (double)ImuData2.Timestamp / 1e6, Tail);
+
+                printf("  Acc X/Y/Z = %.3f / %.3f / %.3f m/s2%s\r\n",
+                       ImuData2.Acc[0], ImuData2.Acc[1], ImuData2.Acc[2], Tail);
+
+                printf("  Gyr X/Y/Z = %.3f / %.3f / %.3f deg/s%s\r\n",
+                       ImuData2.Gyr[0], ImuData2.Gyr[1], ImuData2.Gyr[2], Tail);
+
+                printf("  RPY = %.2f / %.2f / %.2f deg%s\r\n",
+                       ImuData2.Rpy[0], ImuData2.Rpy[1], ImuData2.Rpy[2], Tail);
+
                 break;
 
             case UART_MSGID_DATA3:
-                PrintData3();
+                printf("  数据包3: %u Hz, %04u-%02u-%02u %02u:%02u:%02u%s\r\n",
+                       ImuData3.Freq, ImuData3.Year, ImuData3.Month, ImuData3.Day,
+                       ImuData3.Hour, ImuData3.Minute, ImuData3.Second, Tail);
+
+                printf("  Timestamp = %llu us, PPS %s (mode %u)%s\r\n",
+                       (unsigned long long)ImuData3.Timestamp,
+                       (ImuData3.PpsLock == 1) ? u8"锁定" : u8"失锁",
+                       ImuData3.PpsMode, Tail);
+
+                printf("  Acc  X/Y/Z/|A| = %.3f / %.3f / %.3f / %.3f m/s2%s\r\n",
+                       ImuData3.Acc[0], ImuData3.Acc[1], ImuData3.Acc[2],
+                       ImuData3.Acc[3], Tail);
+
+                printf("  Gyr  X/Y/Z/|W| = %.3f / %.3f / %.3f / %.3f deg/s%s\r\n",
+                       ImuData3.Gyr[0], ImuData3.Gyr[1], ImuData3.Gyr[2],
+                       ImuData3.Gyr[3], Tail);
+
+                printf("  Temp = %.2f C, RPY = %.2f / %.2f / %.2f deg%s\r\n",
+                       ImuData3.Temp, ImuData3.Rpy[0], ImuData3.Rpy[1],
+                       ImuData3.Rpy[2], Tail);
+
+                printf("  Quat = %.5f / %.5f / %.5f / %.5f%s\r\n",
+                       ImuData3.Quat[0], ImuData3.Quat[1], ImuData3.Quat[2],
+                       ImuData3.Quat[3], Tail);
+
+                printf("  Mag  X/Y/Z = %.3f / %.3f / %.3f%s\r\n",
+                       ImuData3.Mag[0], ImuData3.Mag[1], ImuData3.Mag[2], Tail);
+
                 break;
 
             case UART_MSGID_DATA4:
-                PrintData4();
+                printf("  数据包4: Timestamp = %llu us (%.6f s)%s\r\n",
+                       (unsigned long long)ImuData4.Timestamp,
+                       (double)ImuData4.Timestamp / 1e6, Tail);
+
+                printf("  Acc X/Y/Z = %.3f / %.3f / %.3f m/s2%s\r\n",
+                       ImuData4.Acc[0], ImuData4.Acc[1], ImuData4.Acc[2], Tail);
+
+                printf("  Gyr X/Y/Z = %.3f / %.3f / %.3f deg/s%s\r\n",
+                       ImuData4.Gyr[0], ImuData4.Gyr[1], ImuData4.Gyr[2], Tail);
+
                 break;
 
             default:
