@@ -1,12 +1,13 @@
-# `IMU Linux` 串口统计验证程序 (uart_stat)
+# `IMU Linux` 串口验证程序 (uart_stat + at_test)
 
 [TOC]
 
 ## 概述
 
-	本项目是基于志翔`IMU`的 Linux 串口**测试验证程序**，参照 `feature/LinuxCanTestVerifDemo` 分支的统计方式与三层架构（驱动/队列/协议），通过串口接收志翔私有协议推送报文，实现**数据包1/2/3/4 的帧级统计与解析**。
+	本项目是基于志翔`IMU`的 Linux 串口**测试验证程序集**，参照 `feature/LinuxCanTestVerifDemo` 分支的统计方式与三层架构（驱动/队列/协议），包含两个工具：
 
-	适用于验证 IMU 串口数据流的**帧率是否达标、间隔是否均匀、有无断流**，以及各包物理量解析正确性。
+	- **uart_stat**：数据流验证 —— 接收志翔私有协议推送报文，实现数据包1/2/3/4 的帧级统计与解析，验证帧率是否达标、间隔是否均匀、有无断流、物理量解析正确性。
+	- **at_test**：AT指令验证 —— 依据《用户协议》第2章逐条下发 AT 指令并按文档应答格式判定，验证完成后自动还原配置。
 
 ## 功能特性
 
@@ -37,7 +38,8 @@
 ├── drv_serial.c/h         # 串口驱动模块（termios，8N1，低延迟）
 ├── bsp_uart_queue.c/h     # 字节流SPSC环形队列模块（4KB）
 ├── bsp_uart_protocol.c/h  # 协议层：帧同步/CRC16/统计/数据包1~4解析
-├── run.sh                 # 一键编译运行脚本
+├── bsp_at_test.c          # AT指令逐条验证器（查询/动作分组，配置自动还原）
+├── run.sh                 # 一键编译运行脚本（菜单选择 uart_stat / at_test）
 └── Readme.md              # 项目说明文档
 ```
 
@@ -53,7 +55,7 @@ UartRecvThread(生产者)  --字节流-->  UartQueue  --字节流-->  UartParseT
 ## 构建与运行
 
 ```bash
-# 一键编译运行（默认 /dev/ttyUSB0 @921600，直到Ctrl-C）
+# 一键编译并弹出功能菜单（1=数据流统计 uart_stat / 2=AT指令验证 at_test）（默认 /dev/ttyUSB0 @921600）
 ./run.sh
 
 # 指定串口/波特率/限时10秒
@@ -61,9 +63,24 @@ UartRecvThread(生产者)  --字节流-->  UartQueue  --字节流-->  UartParseT
 
 # 手动编译
 gcc -O2 -Wall -o uart_stat main.c drv_serial.c bsp_uart_queue.c bsp_uart_protocol.c -lpthread
+gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
 ```
 
 用法：`./uart_stat [串口设备] [波特率] [持续秒数]`，持续秒数 0 或缺省=直到 Ctrl-C。
+
+用法：`./at_test [串口设备] [波特率] [模式]`，模式 0=仅安全组（默认），1=安全组+风险组（改配置项验证后自动还原）。
+
+## AT指令验证说明 (at_test)
+
+依据《用户协议》第2章 AT 指令表逐条验证，判定规则：
+
+| 组别 | 内容 | 判定 | 副作用处理 |
+|---|---|---|---|
+| 安全组 | 13 条只读查询 + 数据流开关 + YAW归零 | 查询类按文档应答格式逐项匹配（如 `AppVersion:`/`UARTBaudRate:` + `OK`）；动作类收到 `OK` 即过 | SET 开关成对执行后恢复原态；YAW 归零为一次性动作 |
+| 风险组 | PPS 开关、MSGID=22 推送开关、GRAPHRQ/ORIGRQ 频率 | 同上 | **成对设计：先验证设置，紧接下发还原指令**（如 PPS=ON→PPS=OFF，MSGID=22,1→22,0），无成对项则告警提示手动检查 |
+| 暂不内置 | BAUD/COORDINATE/PUSHFRQ 等掉电保存且影响链路或数据语义的项 | — | 改波特率会使本工具失联、改坐标系影响数据判读，避免在自动流程中执行；如需验证建议手动单项进行 |
+
+超时 800ms 无 `OK` 判 FAIL；数据流推送报文与 AT 应答共存于同一串口，工具按"完整 `OK\r\n` 结尾"提取应答，原始应答片段原样打印便于人工复核。
 
 ## 实时输出说明
 
@@ -109,3 +126,4 @@ gcc -O2 -Wall -o uart_stat main.c drv_serial.c bsp_uart_queue.c bsp_uart_protoco
 5. 版本：V1.1.3（2026-10-15）—— 统计打印格式对齐 CAN 工程（统计中/已运行 %.1fs、CAN 列宽表头、Δt 行改"0xXX时间戳差值Δt: 最新/平均/最小/最大/样本"措辞、等待行"等待第二个0xXX包..."）
 6. 版本：V1.2.0（2026-10-15）—— Δt 统计去掉 >1s 异常样本过滤，改为全样本统计（与 CAN 分支 0x091 语义一致），时间戳重置/回退不再被吞掉、直接体现在最小/最大/平均
 7. 版本：V1.2.1（2026-10-15）—— 修复终端模式刷新堆叠：每次整块回退覆盖重绘（统计表+解析+Δt 共 31 行一起原地位移），统计行改默认 \r 起始+清行尾（残留长行不再顶乱表格列）
+8. 版本：V1.3.0（2026-10-15）—— 新增 AT 指令逐条验证器 at_test（安全组13查询+开关动作 / 风险组成对验证自动还原），run.sh 升级为功能选择菜单（1=uart_stat / 2=at_test）
