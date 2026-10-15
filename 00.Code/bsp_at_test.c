@@ -2,25 +2,27 @@
  *******************************************************************************
  * @file    bsp_at_test.c
  * @author  杨镒铭
- * @version V1.0.0
+ * @version V1.3.1
  * @date    2026-10-15
  * @brief   志翔IMU AT指令逐条验证器
  *
  * @detail
- *   依据 01.Doc/用户协议.md 第2章 AT指令表, 对每条AT指令做 实测验证:
- *   - 查询类: 下发指令 → 收应答 → 按文档应答格式逐项匹配(如 AppVersion:/OK)
- *   - 动作类: 下发指令 → 收 OK 应答即通过
- *   - 分组执行: 安全组(只读查询+无副作用的动作)/风险组(改配置且掉电保存)
- *   - 风险组先记录原值, 验证后自动还原(还原也验证)
- *   - 明细+汇总报告
+ *   依据 01.Doc/用户协议.md 第2章 AT指令表, 对每条AT指令做实测验证:
+ *   - 查询类: 下发指令 -> 收应答 -> 按文档应答格式逐项匹配(如 AppVersion:) + OK
+ *   - 动作类: 下发指令 -> 收 OK 应答即通过
+ *   - 分组执行: 安全组(只读查询+无副作用动作)/风险组(改配置且掉电保存)
+ *   - 风险组验证后自动还原(成对紧邻或表内扫描), 还原动作不重复计分
+ *   - 输出为安静模式: 每条指令一行, 结束后输出汇总表
  *
- * @note  验证时设备数据流会与AT应答混在同一串口, 本工具独占串口期间
- *        数据流照收但只按行缓冲处理AT应答
+ * @note  设备数据流(50Hz文本/二进制帧)与AT应答混在同一串口:
+ *        应答接收时过滤不可见字节, 在全缓冲搜索"OK\r\n"判定应答结束,
+ *        避免OK后跟数据噪声导致的假FAIL
  *
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
- * <tr><td>V1.0.0<td>2026-10-15<td>杨镒铭<td>创建
+ * <tr><td>V1.3.1<td>2026-10-15<td>杨镒铭<td>输出整理: 每条一行+末尾汇总表; 修数据流混流假FAIL(全缓冲搜OK+过滤二进制); 修banner字面转义
+ * <tr><td>V1.3.0<td>2026-10-15<td>杨镒铭<td>创建: 安全组13查询+SET/YAWRESET, 风险组成对验证自动还原
  *   </table>
  *******************************************************************************
  */
@@ -39,8 +41,11 @@
 =                       配置与常量
 ===========================================================*/
 
-#define AT_RESP_TIMEOUT_MS  800    /* 单条指令应答超时 */
-#define AT_LINE_MAX         256    /* 应答行缓冲 */
+#define AT_RESP_TIMEOUT_MS  1200   /* 单条指令应答超时(数据流混流留余量) */
+#define AT_RESP_MAX         1024   /* 应答缓冲(过滤后文本) */
+#define AT_VALS_MAX         96     /* 提取值显示缓冲 */
+#define AT_LINE_MAX         256    /* 通用行缓冲 */
+#define AT_NOTE_MAX         96     /* 失败原因缓冲 */
 #define AT_CASE_MAX         64     /* 用例上限 */
 
 /** @brief 用例类型 */
@@ -60,7 +65,7 @@ typedef enum
 /** @brief 单条用例定义 */
 typedef struct
 {
-    const char *Cmd;              /* 完整指令文本(含\r\n由发送时补) */
+    const char *Cmd;              /* 完整指令文本(发送时自动补回车换行) */
     AtCaseType_E Type;            /* 查询/动作 */
     AtGroup_E Group;              /* 安全/风险 */
     const char *Desc;             /* 用途说明 */
@@ -72,9 +77,10 @@ typedef struct
 typedef struct
 {
     int Done;                     /* 已执行 */
+    int Skip;                     /* 跳过(风险组未启用) */
     int Pass;                     /* 通过 */
-    char Resp[AT_LINE_MAX * 4];   /* 原始应答(截断保存) */
-    char Note[AT_LINE_MAX];       /* 备注(超时/缺失关键字等) */
+    char Vals[AT_VALS_MAX];       /* 查询类提取的关键值(如 AppVersion:3.0.0.4) */
+    char Note[AT_NOTE_MAX];       /* 失败原因/备注 */
 } AtResult_S;
 
 /*===========================================================
@@ -97,14 +103,13 @@ static AtCase_S G_Cases[] =
     { "AT+DATALINK?",   AT_T_QUERY, AT_G_SAFE, "数据链路查询",      NULL, "DATALINK" },
     { "AT+GRAPHRQ?",    AT_T_QUERY, AT_G_SAFE, "主图推送频率查询",  NULL, "DataPushFre:" },
     { "AT+ORIGRQ?",     AT_T_QUERY, AT_G_SAFE, "原始数据频率查询",  NULL, "DataPushFre:" },
-    /* CANBAUD? 部分固件无CAN硬件不回, 放风险组之后单独可选 */
 
     /* ---------- 安全组: 无持久副作用的动作 ---------- */
     { "AT+SET=OFF",     AT_T_ACTION, AT_G_SAFE, "关数据流", "AT+SET=ON", "" },
     { "AT+SET=ON",      AT_T_ACTION, AT_G_SAFE, "开数据流", NULL, "" },
     { "AT+YAWRESET",    AT_T_ACTION, AT_G_SAFE, "YAW归零",  NULL, "" },
 
-    /* ---------- 风险组: 改配置掉电保存, 先记录原值后还原 ---------- */
+    /* ---------- 风险组: 改配置掉电保存, 验证后自动还原 ---------- */
     { "AT+PPS=ON",      AT_T_ACTION, AT_G_RISK, "开PPS",   "AT+PPS=OFF", "" },
     { "AT+PPS=OFF",     AT_T_ACTION, AT_G_RISK, "关PPS",   NULL,          "" },
     { "AT+MSGID=22,1",  AT_T_ACTION, AT_G_RISK, "开0x22推送", "AT+MSGID=22,0", "" },
@@ -137,6 +142,21 @@ static void OnSignal(int Sig)
 }
 
 /**
+ * @brief 安装信号(不带SA_RESTART): 让阻塞read被信号打断返回EINTR,
+ *        主循环才能及时检查G_Running退出
+ */
+static void InstallSignal(int Sig)
+{
+    struct sigaction Sa;
+
+    memset(&Sa, 0, sizeof(Sa));
+
+    Sa.sa_handler = OnSignal;
+
+    (void)sigaction(Sig, &Sa, NULL);
+}
+
+/**
  * @brief 毫秒级单调时刻
  */
 static double NowMs(void)
@@ -149,11 +169,11 @@ static double NowMs(void)
 }
 
 /**
- * @brief 发送一条AT指令(自动补\r\n)
+ * @brief 发送一条AT指令(自动补回车换行), 安静模式不打印
  */
 static int AtSend(DrvSerial_S *pDrv, const char *Cmd)
 {
-    unsigned char Buf[AT_LINE_MAX];
+    unsigned char Buf[AT_RESP_MAX];
 
     int Len;
 
@@ -170,18 +190,15 @@ static int AtSend(DrvSerial_S *pDrv, const char *Cmd)
 
     Buf[Len + 1] = '\n';
 
-    printf("  >> %s\\r\\n", Cmd);
-
     return DrvSerialSend(pDrv, Buf, Len + 2);
 }
 
 /**
- * @brief 收应答直到超时: 数据流噪声中提取以OK结尾的完整应答段
+ * @brief 收应答直到超时: 过滤不可见字节(数据流二进制噪声), 全缓冲搜索OK判定结束
  *
- * @param pResp 出参: 收到的可见字符(含数据流, 按行展示时过滤)
- * @return 1=收到OK 0=超时未收到
+ * @return 1=收到OK(缓冲截断到OK之后) 0=超时未收到
  */
-static int AtRecvOk(DrvSerial_S *pDrv, char *pResp, int RespSize, double TimeoutMs)
+static int AtRecvResp(DrvSerial_S *pDrv, char *pResp, double TimeoutMs)
 {
     unsigned char Buf[512];
 
@@ -189,39 +206,44 @@ static int AtRecvOk(DrvSerial_S *pDrv, char *pResp, int RespSize, double Timeout
 
     int Len = 0;
 
+    pResp[0] = '\0';
+
     while (G_Running && ((NowMs() - Start) < TimeoutMs))
     {
         int n = DrvSerialRecv(pDrv, Buf, (int)sizeof(Buf));
 
+        int i;
+
         if (n <= 0)
         {
-            usleep(2000); /* 阻塞读无超时参数, 空转让出CPU并降低走时粒度 */
-
-            continue;
+            continue; /* VTIME=1半阻塞读: 无数据100ms返回, 循环可及时响应SIGINT */
         }
 
+        /* 只保留可见字符与回车换行, 丢弃数据流二进制字节(防止0x00截断后续匹配) */
+        for (i = 0; i < n; i++)
         {
-            int i;
+            unsigned char c = Buf[i];
 
-            for (i = 0; i < n; i++)
+            if (((c >= 0x20) && (c < 0x7F)) || (c == 0x0D) || (c == 0x0A))
             {
-                if (Len < (RespSize - 1))
+                if (Len < (AT_RESP_MAX - 1))
                 {
-                    pResp[Len++] = (char)Buf[i];
+                    pResp[Len++] = (char)c;
                 }
             }
         }
 
-        /* 已收到OK(允许数据流噪声前缀, 以最后出现的OK为准提前结束) */
-        if (Len >= 2)
-        {
-            if ((Len >= 4) && (pResp[Len - 4] == 'O') &&
-                (pResp[Len - 3] == 'K') &&
-                (pResp[Len - 2] == '\r') && (pResp[Len - 1] == '\n'))
-            {
-                pResp[Len] = '\0';
+        pResp[Len] = '\0';
 
-                return 1; /* 完整"OK\r\n"结尾: 应答收全 */
+        /* 全缓冲搜索OK: 应答OK后跟数据噪声/分块到达均不漏判 */
+        {
+            char *pOk = strstr(pResp, "OK\r\n");
+
+            if (pOk != NULL)
+            {
+                pOk[4] = '\0'; /* 截断到OK换行之后 */
+
+                return 1;
             }
         }
     }
@@ -232,7 +254,7 @@ static int AtRecvOk(DrvSerial_S *pDrv, char *pResp, int RespSize, double Timeout
 }
 
 /**
- * @brief 查询类应答关键字匹配(逗号分隔的关键字全部命中才算过)
+ * @brief 查询类应答关键字逐项匹配(全部命中才算过)
  */
 static int MatchExpect(const char *pResp, const char *Expect, char *pNote, int NoteSize)
 {
@@ -255,7 +277,7 @@ static int MatchExpect(const char *pResp, const char *Expect, char *pNote, int N
     {
         if (strstr(pResp, Tok) == NULL)
         {
-            snprintf(pNote, (size_t)NoteSize, "缺失关键字: %s", Tok);
+            snprintf(pNote, (size_t)NoteSize, "应答缺关键字 %s", Tok);
 
             return 0;
         }
@@ -267,69 +289,106 @@ static int MatchExpect(const char *pResp, const char *Expect, char *pNote, int N
 }
 
 /**
- * @brief 打印应答可读形式(可见字符, 不可见转\h)
+ * @brief 从应答提取关键字对应值(供汇总表展示, 如 AppVersion:3.0.0.4)
  */
-static void PrintResp(const char *pResp)
+static void ExtractVals(const char *pResp, const char *Expect, char *pVals, int ValsSize)
 {
-    int i;
+    char Tmp[AT_LINE_MAX];
 
-    printf("  << ");
+    char *Tok;
 
-    for (i = 0; (pResp[i] != '\0') && (i < 400); i++)
+    int Used = 0;
+
+    pVals[0] = '\0';
+
+    if ((Expect == NULL) || (Expect[0] == '\0'))
     {
-        unsigned char c = (unsigned char)pResp[i];
-
-        if ((c >= 0x20) && (c < 0x7F))
-        {
-            putchar(c);
-        }
-        else if (c == 0x0D)
-        {
-            printf("\\\\r");
-        }
-        else if (c == 0x0A)
-        {
-            printf("\\\\n");
-        }
-        else
-        {
-            printf("[%02X]", c);
-        }
+        return;
     }
 
-    printf("\\r\\n");
+    strncpy(Tmp, Expect, sizeof(Tmp) - 1);
+
+    Tmp[sizeof(Tmp) - 1] = '\0';
+
+    Tok = strtok(Tmp, ",");
+
+    while (Tok != NULL)
+    {
+        const char *p = strstr(pResp, Tok);
+
+        if (p != NULL)
+        {
+            char One[40];
+
+            int j = 0;
+
+            p += strlen(Tok);
+
+            while ((*p != '\0') && (*p != '\r') && (*p != '\n') && (j < (int)sizeof(One) - 1))
+            {
+                One[j++] = *p++;
+
+            }
+
+            One[j] = '\0';
+
+            {
+                int Need = (int)strlen(Tok) + (int)strlen(One) + 2;
+
+                if ((Used + Need) < ValsSize)
+                {
+                    Used += sprintf(pVals + Used, "%s%s ", Tok, One);
+                }
+            }
+        }
+
+        Tok = strtok(NULL, ",");
+    }
+
+    if (Used > 0)
+    {
+        pVals[Used - 1] = '\0'; /* 去尾空格 */
+    }
 }
 
 /**
- * @brief 执行单条用例
+ * @brief 执行单条用例(安静模式, 不打印过程)
  */
 static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
 {
     tcflush(pDrv->Fd, TCIOFLUSH); /* 清残留字节, 避免上一条应答串扰 */
 
-    memset(pRes->Resp, 0, sizeof(pRes->Resp));
+    pRes->Vals[0] = '\0';
+
+    pRes->Note[0] = '\0';
 
     pRes->Done = 1;
 
     if (AtSend(pDrv, pCase->Cmd) != 0)
     {
-        strncpy(pRes->Note, "发送失败", sizeof(pRes->Note) - 1);
+        snprintf(pRes->Note, sizeof(pRes->Note), "发送失败");
 
         return;
     }
 
-    if (AtRecvOk(pDrv, pRes->Resp, (int)sizeof(pRes->Resp), AT_RESP_TIMEOUT_MS) == 0)
     {
-        strncpy(pRes->Note, "超时未收到OK", sizeof(pRes->Note) - 1);
+        static char Resp[AT_RESP_MAX];
 
-        return;
-    }
-
-    if (pCase->Type == AT_T_QUERY)
-    {
-        if (MatchExpect(pRes->Resp, pCase->Expect, pRes->Note, (int)sizeof(pRes->Note)) == 0)
+        if (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0)
         {
+            snprintf(pRes->Note, sizeof(pRes->Note), "超时未收到OK");
+
             return;
+        }
+
+        if (pCase->Type == AT_T_QUERY)
+        {
+            if (MatchExpect(Resp, pCase->Expect, pRes->Note, (int)sizeof(pRes->Note)) == 0)
+            {
+                return;
+            }
+
+            ExtractVals(Resp, pCase->Expect, pRes->Vals, (int)sizeof(pRes->Vals));
         }
     }
 
@@ -337,24 +396,35 @@ static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
 }
 
 /**
- * @brief 执行还原指令并打印结果
+ * @brief 执行一条还原指令并返回是否通过(不打印, 结果行由调用方统一输出)
  */
-static void RunRestore(DrvSerial_S *pDrv, AtCase_S *pCase)
+static int RunRestore(DrvSerial_S *pDrv, AtCase_S *pCase)
 {
     AtResult_S Res;
 
-    char Disp[AT_LINE_MAX];
-
     memset(&Res, 0, sizeof(Res));
-
-    memset(Disp, 0, sizeof(Disp));
 
     RunCase(pDrv, pCase, &Res);
 
-    PrintResp(Res.Resp);
+    return Res.Pass;
+}
 
-    printf("  还原 %s: %s\\r\\n", pCase->Cmd,
-           Res.Pass ? "OK" : "失败(需手动检查)");
+/**
+ * @brief 汇总表状态字符串
+ */
+static const char *StatStr(const AtResult_S *pRes)
+{
+    if (pRes->Skip != 0)
+    {
+        return "SKIP";
+    }
+
+    if (pRes->Done == 0)
+    {
+        return "----";
+    }
+
+    return (pRes->Pass != 0) ? "PASS" : "FAIL";
 }
 
 int main(int argc, char *argv[])
@@ -367,6 +437,8 @@ int main(int argc, char *argv[])
 
     int FailNum = 0;
 
+    int SkipNum = 0;
+
     /* 用法: at_test [串口] [波特率] [模式0/1] */
     if (argc > 1) { strncpy(Serial.Dev, argv[1], sizeof(Serial.Dev) - 1); }
 
@@ -374,117 +446,175 @@ int main(int argc, char *argv[])
 
     int RunRisk = (argc > 3) ? atoi(argv[3]) : 0; /* 参数3=是否跑风险组 */
 
-    signal(SIGINT, OnSignal);
+    InstallSignal(SIGINT);
 
-    signal(SIGTERM, OnSignal);
+    InstallSignal(SIGTERM);
 
-    printf("===== AT指令验证器 开始 (设备 %s @%d) =====\\r\\n", Serial.Dev, Serial.Baud);
+    printf("===== AT指令验证器 V1.3.1 (设备 %s @%d, %s) =====\n",
+           Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
     {
-        printf("打开串口失败\\r\\n");
+        printf("打开串口失败\n");
 
         return -1;
     }
 
-    printf("共 %u 条用例: 安全组 %s\\r\\n", (unsigned)CASE_NUM,
-           RunRisk ? "+风险组" : "仅安全组(传参数1跑风险组)");
+    /* 半阻塞读: VTIME=1(100ms), 必须在DrvSerialOpen之后覆盖其VMIN=1配置 */
+    {
+        struct termios Opt;
 
-    /* ---------- 逐条执行 ---------- */
+        tcgetattr(Serial.Fd, &Opt);
+
+        Opt.c_cc[VMIN] = 0;
+
+        Opt.c_cc[VTIME] = 1;
+
+        tcsetattr(Serial.Fd, TCSANOW, &Opt);
+    }
+
+    /* ---------- 逐条执行: 每条一行 ---------- */
     for (i = 0; (i < CASE_NUM) && G_Running; i++)
     {
         AtCase_S *pCase = &G_Cases[i];
 
         if ((pCase->Group == AT_G_RISK) && (RunRisk == 0))
         {
-            printf("[%2u] %-32s 跳过(风险组)\\r\\n", i + 1, pCase->Cmd);
+            G_Result[i].Skip = 1;
+
+            printf("[%2u] %-18s SKIP  风险组未启用\n", i + 1, pCase->Cmd);
 
             continue;
         }
 
-        printf("[%2u] %-32s (%s)\\r\\n", i + 1, pCase->Cmd, pCase->Desc);
+        printf("[%2u] %-18s .... ", i + 1, pCase->Cmd);
+
+        fflush(stdout);
 
         RunCase(&Serial, pCase, &G_Result[i]);
 
-        PrintResp(G_Result[i].Resp);
+        printf("%s  %s\n", G_Result[i].Pass ? "PASS" : "FAIL",
+               G_Result[i].Pass ? (G_Result[i].Vals[0] ? G_Result[i].Vals : pCase->Desc)
+                                 : G_Result[i].Note);
 
-        if (G_Result[i].Pass)
-        {
-            printf("  结果: PASS\\r\\n");
-
-            PassNum++;
-        }
-        else
-        {
-            printf("  结果: FAIL (%s)\\r\\n",
-                   G_Result[i].Note[0] ? G_Result[i].Note : "应答异常");
-
-            FailNum++;
-        }
-
-        /* 风险组还原: 有还原指令的设置类, 下一条正好是还原项(成对设计),
-           还原动作不重复计数, 只执行并打印 */
+        /* 风险组还原: 紧邻成对顺带执行; 否则表内扫描同名还原项 */
         if ((pCase->Group == AT_G_RISK) && (pCase->RestoreCmd != NULL) && G_Running)
         {
+            unsigned r;
+
+            int Found = 0;
+
             if (((i + 1) < CASE_NUM) &&
                 (strcmp(G_Cases[i + 1].Cmd, pCase->RestoreCmd) == 0))
             {
-                printf("     还原 -> %s\\r\\n", pCase->RestoreCmd);
+                int Ok = RunRestore(&Serial, &G_Cases[i + 1]);
 
-                RunRestore(&Serial, &G_Cases[i + 1]);
+                G_Result[i + 1].Done = 1;
 
-                i++; /* 还原项已顺带执行, 跳过其独立计分 */
+                G_Result[i + 1].Pass = Ok;
+
+                snprintf(G_Result[i + 1].Note, sizeof(G_Result[i + 1].Note), "还原动作");
+
+                printf("     -> 还原 %-14s %s\n", pCase->RestoreCmd, Ok ? "PASS" : "FAIL");
+
+                i++;
+
+                Found = 1;
             }
             else
             {
-                /* 非紧邻: 表内搜索同名还原项单独执行(还原动作不计分) */
-                unsigned r;
-
-                int Found = 0;
-
                 for (r = 0; r < CASE_NUM; r++)
                 {
                     if ((r != i) && (strcmp(G_Cases[r].Cmd, pCase->RestoreCmd) == 0))
                     {
-                        printf("     还原 -> %s\\r\\n", pCase->RestoreCmd);
-
-                        RunRestore(&Serial, &G_Cases[r]);
+                        int Ok = RunRestore(&Serial, &G_Cases[r]);
 
                         G_Result[r].Done = 1;
 
-                        G_Result[r].Pass = 1;
+                        G_Result[r].Pass = Ok;
+
+                        snprintf(G_Result[r].Note, sizeof(G_Result[r].Note), "还原动作");
+
+                        printf("     -> 还原 %-14s %s\n", pCase->RestoreCmd, Ok ? "PASS" : "FAIL");
 
                         Found = 1;
 
                         break;
                     }
                 }
+            }
 
-                if (Found == 0)
-                {
-                    printf("  [WARN] 用例表缺少还原项: %s\\r\\n", pCase->RestoreCmd);
-                }
+            if (Found == 0)
+            {
+                printf("     -> [WARN] 用例表缺少还原项: %s\n", pCase->RestoreCmd);
             }
         }
     }
 
     DrvSerialClose(&Serial);
 
-    /* ---------- 汇总 ---------- */
-    printf("\\r\\n===== AT验证汇总 =====\\r\\n");
+    /* ---------- 汇总表 ---------- */
+    printf("\n==================== 验证结果汇总 ====================\n");
 
-    printf("PASS %d / FAIL %d / 总计 %u (风险组%s)\\r\\n",
-           PassNum, FailNum, (unsigned)CASE_NUM, RunRisk ? "已执行" : "未执行");
+    printf("%-4s %-18s %-4s %s\n", "序号", "指令", "结果", "说明");
+
+    for (i = 0; i < CASE_NUM; i++)
+    {
+        AtResult_S *pRes = &G_Result[i];
+
+        const char *Stat = StatStr(pRes);
+
+        const char *Info;
+
+        if (pRes->Skip != 0)
+        {
+            Info = "风险组未启用";
+        }
+        else if (pRes->Done == 0)
+        {
+            Info = "未执行(中断)";
+        }
+        else if (pRes->Pass != 0)
+        {
+            Info = (pRes->Vals[0] != '\0') ? pRes->Vals
+                 : (pRes->Note[0] != '\0') ? pRes->Note : G_Cases[i].Desc;
+        }
+        else
+        {
+            Info = (pRes->Note[0] != '\0') ? pRes->Note : "应答异常";
+        }
+
+        printf("[%2u] %-18s %-4s %s\n", i + 1, G_Cases[i].Cmd, Stat, Info);
+
+        if (pRes->Skip != 0)
+        {
+            SkipNum++;
+        }
+        else if (pRes->Done && (pRes->Pass != 0))
+        {
+            PassNum++;
+        }
+        else if (pRes->Done)
+        {
+            FailNum++;
+        }
+    }
+
+    printf("------------------------------------------------------\n");
+
+    printf("通过 PASS %d / 失败 FAIL %d / 跳过 SKIP %d / 共 %u 条\n",
+           PassNum, FailNum, SkipNum, (unsigned)CASE_NUM);
 
     if (FailNum > 0)
     {
-        printf("失败用例:\\r\\n");
+        printf("\n失败用例(需关注):\n");
 
         for (i = 0; i < CASE_NUM; i++)
         {
-            if (G_Result[i].Done && (G_Result[i].Pass == 0))
+            if (G_Result[i].Done && (G_Result[i].Pass == 0) && (G_Result[i].Skip == 0))
             {
-                printf("  - %s (%s)\\r\\n", G_Cases[i].Cmd, G_Result[i].Note);
+                printf("  x %s : %s\n", G_Cases[i].Cmd,
+                       (G_Result[i].Note[0] != '\0') ? G_Result[i].Note : "应答异常");
             }
         }
     }
