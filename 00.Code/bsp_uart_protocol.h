@@ -40,9 +40,9 @@
 #define UART_FRAME_DATA_MAX 255
 #define UART_FRAME_MAX_LEN  (UART_FRAME_HEAD_LEN + UART_FRAME_DATA_MAX + UART_FRAME_CRC_LEN)
 
-/** @brief 统计打印块固定行数(表头2+表格4+空行+解析表头+4包解析20行),
+/** @brief 统计打印块固定行数(表头2+表格4+空行+解析表头+4包解析20行+Δt统计1行),
  *         终端原地刷新用: 每次打印后回退该行数覆盖重绘 */
-#define UART_STAT_PRINT_LINES 28
+#define UART_STAT_PRINT_LINES 29
 
 /** @brief 帧同步状态机状态 */
 typedef enum
@@ -83,6 +83,19 @@ typedef struct
     unsigned char LastData[UART_FRAME_DATA_MAX]; /* 末帧数据域 */
     unsigned short LastDlen;    /* 末帧数据域长度 */
 } UartFrameStat_S;
+
+/** @brief 设备时间戳差值Δt统计(带us时间戳的数据包2/3/4, 与CAN分支0x091同思路)
+ *  @note  时间戳回退/重置(差值>1s)视为异常样本丢弃, 只更新基准 */
+typedef struct
+{
+    unsigned long long Sample;  /* 差值样本数(第2帧起才有) */
+    double LastDeltaMs;         /* 最新Δt */
+    double MinDeltaMs;          /* 最小Δt */
+    double MaxDeltaMs;          /* 最大Δt */
+    double SumDeltaMs;          /* Δt累计, 求平均用 */
+    uint64_t PrevUs;            /* 上一帧设备时间戳 */
+    unsigned char HasPrev;      /* 已有上一帧时间戳 */
+} UartTsDelta_S;
 
 /** @brief 传感器推送数据1(0x00 0x01)解析结果 */
 typedef struct
@@ -158,6 +171,23 @@ unsigned char BspUartProtocolGetMsgId(unsigned int Index);
  * @return NULL=Index越界
  */
 const UartFrameStat_S *BspUartProtocolGetStat(unsigned int Index);
+
+/**
+ * @brief 获取CRC校验失败帧数(诊断用)
+ */
+unsigned long long BspUartProtocolGetCrcFail(void);
+
+/**
+ * @brief 获取状态机累计喂入字节数(诊断用)
+ */
+unsigned long long BspUartProtocolGetFeedBytes(void);
+
+/**
+ * @brief 获取设备时间戳差值Δt统计(只读, 仅带时间戳的数据包2/3/4有效)
+ * @param Index 0~3对应数据包1/2/3/4
+ * @return NULL=Index越界
+ */
+const UartTsDelta_S *BspUartProtocolGetTsDelta(unsigned int Index);
 
 /**
  * @brief 打印统计表格+各包最新帧解析值(Tty=1时上层配合光标回退原地刷新)

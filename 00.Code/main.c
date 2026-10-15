@@ -354,8 +354,10 @@ int main(int argc, char *argv[])
 
     printf("\r\n=== 汇总(共 %.1fs) ===\r\n", NowSec() - G_StartSec);
 
-    printf("串口接收: %llu 字节, CRC通过帧: %llu, 队列丢弃字节: %u\r\n",
-           G_RxBytes, G_FrameOk, G_Queue.DropCount);
+    printf("串口接收: %llu 字节, 状态机喂入: %llu, CRC通过帧: %llu, "
+           "CRC失败帧: %llu, 队列丢弃字节: %u\r\n",
+           G_RxBytes, BspUartProtocolGetFeedBytes(), G_FrameOk,
+           BspUartProtocolGetCrcFail(), G_Queue.DropCount);
 
     {
         unsigned int i;
@@ -391,6 +393,21 @@ int main(int argc, char *argv[])
                        "平均间隔 %.3f ms [min %.3f / max %.3f]\r\n",
                        MsgId, Stat->Count, AvgHz, Stat->LastIntMs,
                        AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs);
+            }
+
+            /* 带时间戳的包补Δt汇总 */
+            {
+                const UartTsDelta_S *Tsd = BspUartProtocolGetTsDelta(i);
+
+                if ((Tsd != NULL) && (Tsd->Sample > 0))
+                {
+                    printf("0x%02X 时间戳Δt: 最新 %.3f ms, 平均 %.3f ms, "
+                           "最小 %.3f ms, 最大 %.3f ms, 样本 %llu\r\n",
+                           MsgId, Tsd->LastDeltaMs,
+                           Tsd->SumDeltaMs / (double)Tsd->Sample,
+                           Tsd->MinDeltaMs, Tsd->MaxDeltaMs,
+                           Tsd->Sample);
+                }
             }
         }
     }

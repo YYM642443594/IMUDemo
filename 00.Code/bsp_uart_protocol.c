@@ -47,6 +47,15 @@ static const MsgDef_S MsgDef[UART_MSG_NUM] =
 /** @brief 各报文帧统计(下标0~3=数据包1/2/3/4) */
 static UartFrameStat_S FrameStat[UART_MSG_NUM];
 
+/** @brief 各报文设备时间戳差值统计(仅数据包2/3/4使用) */
+static UartTsDelta_S TsDelta[UART_MSG_NUM];
+
+/** @brief 状态机累计喂入字节数(含坏字节) */
+static unsigned long long FeedBytes = 0;
+
+/** @brief CRC校验失败整帧数 */
+static unsigned long long CrcFailCount = 0;
+
 /** @brief 帧同步状态机 */
 static UartParse_S Parse;
 
@@ -122,6 +131,73 @@ static float GetFloatLE(const unsigned char *p)
     Cv.U = GetU32LE(p);
 
     return Cv.F;
+}
+
+/** @brief 报文ID->设备时间戳在数据域内的偏移, 无时间戳返回-1 */
+static int TsOffset(unsigned char Id)
+{
+    switch (Id)
+    {
+        case UART_MSGID_DATA2:
+            return 0; /* 0x0010: 时间戳在数据域起始 */
+
+        case UART_MSGID_DATA3:
+            return 11; /* 0x0013: 频率4+日期时间7之后 */
+
+        case UART_MSGID_DATA4:
+            return 0; /* 0x0022: 时间戳在数据域起始 */
+
+        default:
+            return -1;
+    }
+}
+
+/**
+ * @brief 设备时间戳差值Δt更新(无符号相减回绕安全, >1s异常样本丢弃)
+ */
+static void TsDeltaUpdate(int Index, uint64_t TsUs)
+{
+    UartTsDelta_S *Tsd = &TsDelta[Index];
+
+    if (Tsd->HasPrev == 0)
+    {
+        Tsd->PrevUs = TsUs;
+
+        Tsd->HasPrev = 1;
+
+        return; /* 首帧只有基准, 无差值 */
+    }
+
+    /* 无符号相减天然处理正向回绕; 结果>1s视为乱序/重置异常样本, 丢弃不统计
+       (设备us时间戳, 正常流Δt为毫秒级, 1s门限足够宽) */
+    {
+        uint64_t DiffUs = TsUs - Tsd->PrevUs;
+
+        double DeltaMs = (double)DiffUs / 1000.0;
+
+        Tsd->PrevUs = TsUs;
+
+        if (DiffUs > 1000000ULL)
+        {
+            return; /* 异常样本: 乱序/计数器重置, 只更新基准 */
+        }
+
+        if ((Tsd->Sample == 0) || (DeltaMs < Tsd->MinDeltaMs))
+        {
+            Tsd->MinDeltaMs = DeltaMs;
+        }
+
+        if ((Tsd->Sample == 0) || (DeltaMs > Tsd->MaxDeltaMs))
+        {
+            Tsd->MaxDeltaMs = DeltaMs;
+        }
+
+        Tsd->SumDeltaMs += DeltaMs;
+
+        Tsd->LastDeltaMs = DeltaMs;
+
+        Tsd->Sample++;
+    }
 }
 
 /** @brief 报文ID->统计下标, 非数据包1~4返回-1 */
@@ -409,7 +485,9 @@ static int OnFullFrame(void)
 
     if (CrcCalc != CrcRx)
     {
-        return 0; /* 校验失败, 丢弃 */
+        CrcFailCount++; /* 校验失败, 丢弃 */
+
+        return 0;
     }
 
     StatOnFrame(Index, Ts);
@@ -419,6 +497,16 @@ static int OnFullFrame(void)
            &FrameBuf[UART_FRAME_HEAD_LEN], Parse.PayloadLen);
 
     FrameStat[Index].LastDlen = Parse.PayloadLen;
+
+    /* 设备时间戳差值统计(带us时间戳的数据包2/3/4) */
+    {
+        int Off = TsOffset(MsgDef[Index].Id);
+
+        if ((Off >= 0) && (FrameStat[Index].LastDlen == (unsigned short)MsgDef[Index].Dlen))
+        {
+            TsDeltaUpdate(Index, GetU64LE(FrameStat[Index].LastData + Off));
+        }
+    }
 
     /* 数据域长度与协议定义一致才解析, 防错位解读 */
     if (FrameStat[Index].LastDlen == (unsigned short)MsgDef[Index].Dlen)
@@ -456,6 +544,8 @@ static int OnFullFrame(void)
  */
 int BspUartProtocolOnByte(unsigned char Byte)
 {
+    FeedBytes++;
+
     switch (Parse.State)
     {
         case UART_PARSE_STATE_WAIT_SYNC1:
@@ -569,6 +659,35 @@ unsigned char BspUartProtocolGetMsgId(unsigned int Index)
     }
 
     return MsgDef[Index].Id;
+}
+
+/**
+ * @brief 获取CRC校验失败帧数
+ */
+unsigned long long BspUartProtocolGetCrcFail(void)
+{
+    return CrcFailCount;
+}
+
+/**
+ * @brief 获取状态机累计喂入字节数
+ */
+unsigned long long BspUartProtocolGetFeedBytes(void)
+{
+    return FeedBytes;
+}
+
+/**
+ * @brief 获取设备时间戳差值Δt统计(只读)
+ */
+const UartTsDelta_S *BspUartProtocolGetTsDelta(unsigned int Index)
+{
+    if (Index >= UART_MSG_NUM)
+    {
+        return NULL;
+    }
+
+    return &TsDelta[Index];
 }
 
 /**
@@ -761,6 +880,38 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
                 break;
         }
     }
+
+    /* ---------- 设备时间戳差值Δt统计(1行, 数据包2/3/4) ---------- */
+    printf("时间戳Δt(ms):");
+
+    {
+        int Printed = 0;
+
+        for (i = 0; i < UART_MSG_NUM; i++)
+        {
+            const UartTsDelta_S *Tsd = &TsDelta[i];
+
+            if ((TsOffset(MsgDef[i].Id) < 0) || (Tsd->Sample == 0))
+            {
+                continue;
+            }
+
+            printf(" 0x%02X 最新%.3f/平均%.3f/最小%.3f/最大%.3f(N=%llu)",
+                   MsgDef[i].Id, Tsd->LastDeltaMs,
+                   Tsd->SumDeltaMs / (double)Tsd->Sample,
+                   Tsd->MinDeltaMs, Tsd->MaxDeltaMs,
+                   Tsd->Sample);
+
+            Printed = 1;
+        }
+
+        if (Printed == 0)
+        {
+            printf(" 等待数据...");
+        }
+    }
+
+    printf("%s\r\n", Tail);
 
     fflush(stdout);
 }
