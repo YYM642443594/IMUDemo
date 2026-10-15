@@ -714,11 +714,13 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
     int i;
 
+    (void)Tty;
+
     /* ---------- 帧统计表格(表头2行+4行, 格式对齐CAN分支) ---------- */
     printf("\r统计中: ID 0x01/0x10/0x13/0x22  已运行 %.1fs%s\r\n",
            ElapsedSec, Tail);
 
-    printf("%-8s %9s %9s %9s %10s %12s %10s %10s%s\r\n",
+    printf("\r%-8s %9s %9s %9s %10s %12s %10s %10s%s\r\n",
            "ID", "帧数", "平均Hz", "瞬时Hz", "当前ms",
            "平均间隔ms", "最小ms", "最大ms", Tail);
 
@@ -734,7 +736,7 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
         if (Stat->Count == 0)
         {
-            printf("0x%02X    %9s %9s %9s %10s %12s %10s %10s%s\r\n",
+            printf("\r0x%02X    %9s %9s %9s %10s %12s %10s %10s%s\r\n",
                    MsgDef[i].Id, "-", "-", "-", "-", "-", "-", "-", Tail);
 
             continue;
@@ -749,14 +751,14 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
         if (Stat->Count == 1)
         {
-            printf("0x%02X    %9llu %9s %9s %10s %12s %10s %10s%s\r\n",
+            printf("\r0x%02X    %9llu %9s %9s %10s %12s %10s %10s%s\r\n",
                    MsgDef[i].Id, Stat->Count,
                    "-", "-", "-", "-", "-", "-", Tail);
 
             continue;
         }
 
-        printf("0x%02X    %9llu %9.2f %9.2f %10.3f %12.3f %10.3f %10.3f%s\r\n",
+        printf("\r0x%02X    %9llu %9.2f %9.2f %10.3f %12.3f %10.3f %10.3f%s\r\n",
                MsgDef[i].Id, Stat->Count, AvgHz, Stat->InstHz,
                Stat->LastIntMs, AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs, Tail);
     }
