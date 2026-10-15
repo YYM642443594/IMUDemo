@@ -32,6 +32,7 @@ typedef struct {
     double   last_ts;    /* 上一帧时间 */
     double   min_int;    /* 最小间隔 s */
     double   max_int;    /* 最大间隔 s */
+    double   last_int;   /* 最近一次帧间隔(当前帧-上一帧) s */
     double   sum_int;    /* 间隔累计 s */
     double   win_start;  /* 1秒窗口起点 */
     uint64_t win_count;  /* 窗口内帧数 */
@@ -61,15 +62,15 @@ static void print_table(stat_t *st, double elapsed, int redraw)
     } else {
         printf("统计中: ID 0x%03X~0x%03X  已运行 %.1fs\n", ID_MIN, ID_MAX, elapsed);
     }
-    printf("%-8s %9s %9s %9s %12s %10s %10s%s\n",
-           "ID", "帧数", "平均Hz", "瞬时Hz", "平均间隔ms", "最小ms", "最大ms",
+    printf("%-8s %9s %9s %9s %10s %12s %10s %10s%s\n",
+           "ID", "帧数", "平均Hz", "瞬时Hz", "当前ms", "平均间隔ms", "最小ms", "最大ms",
            tty_out ? "\033[K" : "");
 
     for (int i = 0; i < NID; i++) {
         stat_t *p = &st[i];
         if (!p->seen) {
-            printf("0x%03X   %9s %9s %9s %12s %10s %10s%s\n",
-                   ID_MIN + i, "-", "-", "-", "-", "-", "-",
+            printf("0x%03X   %9s %9s %9s %10s %12s %10s %10s%s\n",
+                   ID_MIN + i, "-", "-", "-", "-", "-", "-", "-",
                    tty_out ? "\033[K" : "");
             continue;
         }
@@ -77,16 +78,16 @@ static void print_table(stat_t *st, double elapsed, int redraw)
         double hz_avg = (span > 1e-6) ? (p->count - 1) / span : 0.0;
         double avg_ms = (p->count > 1) ? p->sum_int / (p->count - 1) * 1000.0 : 0.0;
         if (p->count > 1)
-            printf("0x%03X   %9llu %9.2f %9.2f %12.3f %10.3f %10.3f%s\n",
+            printf("0x%03X   %9llu %9.2f %9.2f %10.3f %12.3f %10.3f %10.3f%s\n",
                    ID_MIN + i,
                    (unsigned long long)p->count,
-                   hz_avg, p->hz_inst, avg_ms,
+                   hz_avg, p->hz_inst, p->last_int * 1000.0, avg_ms,
                    p->min_int * 1000.0, p->max_int * 1000.0,
                    tty_out ? "\033[K" : "");
         else
-            printf("0x%03X   %9llu %9s %9s %12s %10s %10s%s\n",
+            printf("0x%03X   %9llu %9s %9s %10s %12s %10s %10s%s\n",
                    ID_MIN + i, (unsigned long long)p->count,
-                   "-", "-", "-", "-", "-", tty_out ? "\033[K" : "");
+                   "-", "-", "-", "-", "-", "-", tty_out ? "\033[K" : "");
     }
     fflush(stdout);
 }
@@ -147,6 +148,7 @@ int main(int argc, char **argv)
                 double dt = t - p->last_ts;
                 if (dt < p->min_int) p->min_int = dt;
                 if (dt > p->max_int) p->max_int = dt;
+                p->last_int = dt;
                 p->sum_int += dt;
                 if (t - p->win_start >= 1.0) {
                     p->hz_inst = p->win_count / (t - p->win_start);
@@ -175,9 +177,10 @@ int main(int argc, char **argv)
         stat_t *p = &st[i];
         if (!p->seen) continue;
         double span = p->last_ts - p->first_ts;
-        printf("0x%03X: %llu 帧, 平均 %.2f Hz, 平均间隔 %.3f ms [min %.3f / max %.3f]\n",
+        printf("0x%03X: %llu 帧, 平均 %.2f Hz, 当前间隔 %.3f ms, 平均间隔 %.3f ms [min %.3f / max %.3f]\n",
                ID_MIN + i, (unsigned long long)p->count,
                span > 1e-6 ? (p->count - 1) / span : 0.0,
+               p->count > 1 ? p->last_int * 1000.0 : 0.0,
                p->count > 1 ? p->sum_int / (p->count - 1) * 1000.0 : 0.0,
                p->min_int * 1000.0, p->max_int * 1000.0);
     }
