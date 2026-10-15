@@ -24,6 +24,7 @@
 #define ID_MIN 0x091
 #define ID_MAX 0x098
 #define NID    (ID_MAX - ID_MIN + 1)
+#define TOTAL_LINES (2 * NID + 5)  /* 终端重绘回退行数: 表格10行+空行+解析区标题/列头+8行 */
 
 typedef struct {
     int      seen;
@@ -37,6 +38,8 @@ typedef struct {
     double   win_start;  /* 1秒窗口起点 */
     uint64_t win_count;  /* 窗口内帧数 */
     double   hz_inst;    /* 瞬时Hz */
+    uint8_t  last_data[8]; /* 最近一帧原始数据 */
+    uint8_t  last_dlc;     /* 最近一帧 DLC */
 } stat_t;
 
 static volatile sig_atomic_t running = 1;
@@ -51,10 +54,79 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* 协议: 小端(intel)。x86 本身小端, 直接 memcpy 解释 */
+static float get_f(const uint8_t *d, int off)
+{
+    float v; memcpy(&v, d + off, 4); return v;
+}
+
+static unsigned long long get_u64(const uint8_t *d)
+{
+    unsigned long long v; memcpy(&v, d, 8); return v;
+}
+
+/* 按 01.Doc/用户协议.md 3.3.2 解析单个 ID 最新帧 */
+static void print_data_row(const stat_t *p, int id, int tty)
+{
+    const char *tail = tty ? "\033[K" : "";
+    char hex[26];
+    char val[112];
+    const uint8_t *d = p->last_data;
+
+    if (!p->seen) {
+        printf("0x%03X  %-24s %s%s\n", id, "-", "-", tail);
+        return;
+    }
+    for (int b = 0; b < 8; b++)
+        snprintf(hex + b * 3, 4, "%02X ", d[b]);
+
+    if (p->last_dlc != 8) {
+        snprintf(val, sizeof val, "DLC=%u, 非协议8字节帧", p->last_dlc);
+    } else switch (id) {
+    case 0x091: {
+        unsigned long long ts = get_u64(d);
+        snprintf(val, sizeof val, "Timestamp = %llu us (%.6f s)", ts, ts * 1e-6);
+        break;
+    }
+    case 0x092:
+        snprintf(val, sizeof val, "Roll = %8.3f °, Pitch = %8.3f °",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    case 0x093:
+        snprintf(val, sizeof val, "Yaw = %8.3f °, Temp = %7.2f ℃",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    case 0x094:
+        snprintf(val, sizeof val, "q1 = %8.5f, q2 = %8.5f",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    case 0x095:
+        snprintf(val, sizeof val, "q3 = %8.5f, q4 = %8.5f",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    case 0x096:
+        snprintf(val, sizeof val, "X_Acc = %8.3f m/s², Y_Acc = %8.3f m/s²",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    case 0x097:
+        snprintf(val, sizeof val, "Z_Acc = %8.3f m/s², X_Gyro = %8.3f °/s",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    case 0x098:
+        snprintf(val, sizeof val, "Y_Gyro = %8.3f °/s, Z_Gyro = %8.3f °/s",
+                 get_f(d, 0), get_f(d, 4));
+        break;
+    default:
+        snprintf(val, sizeof val, "-");
+        break;
+    }
+    printf("0x%03X  %s %s%s\n", id, hex, val, tail);
+}
+
 static void print_table(stat_t *st, double elapsed, int redraw)
 {
     if (tty_out && redraw)
-        printf("\033[%dA", NID + 2);   /* 回到表头重画 */
+        printf("\033[%dA", TOTAL_LINES);   /* 回到表头重画(含解析区) */
 
     if (tty_out) {
         printf("\033[K统计中: ID 0x%03X~0x%03X  已运行 %.1fs  (Ctrl-C 结束)\033[K\n",
@@ -89,6 +161,12 @@ static void print_table(stat_t *st, double elapsed, int redraw)
                    ID_MIN + i, (unsigned long long)p->count,
                    "-", "-", "-", "-", "-", "-", tty_out ? "\033[K" : "");
     }
+    /* ===== 数据解析区: 按协议文档(小端intel)解析每个ID最新一帧 ===== */
+    printf("\n%-8s %-24s %s%s\n", "ID", "原始数据(B0~B7)", "解析值(最新帧, 小端intel)",
+           tty_out ? "\033[K" : "");
+    for (int i = 0; i < NID; i++)
+        print_data_row(&st[i], ID_MIN + i, tty_out);
+
     fflush(stdout);
 }
 
@@ -159,6 +237,8 @@ int main(int argc, char **argv)
             p->last_ts = t;
             p->count++;
             p->win_count++;
+            memcpy(p->last_data, f.data, f.can_dlc > 8 ? 8 : f.can_dlc);
+            p->last_dlc = f.can_dlc;
         }
 
         if (!running) break;
