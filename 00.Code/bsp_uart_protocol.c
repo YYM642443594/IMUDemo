@@ -718,12 +718,13 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
     int i;
 
-    /* ---------- 帧统计表格(表头2行+4行) ---------- */
-    printf("\r统计: 数据包1(0x01)/2(0x10)/3(0x13)/4(0x22)  运行 %.0fs%s\r\n",
+    /* ---------- 帧统计表格(表头2行+4行, 格式对齐CAN分支) ---------- */
+    printf("\r统计中: ID 0x01/0x10/0x13/0x22  已运行 %.1fs%s\r\n",
            ElapsedSec, Tail);
 
-    printf("ID    报文             帧数    平均Hz  瞬时Hz    当前ms    平均ms    最小ms    最大ms%s\r\n",
-           Tail);
+    printf("%-8s %9s %9s %9s %10s %12s %10s %10s%s\r\n",
+           "ID", "帧数", "平均Hz", "瞬时Hz", "当前ms",
+           "平均间隔ms", "最小ms", "最大ms", Tail);
 
     for (i = 0; i < UART_MSG_NUM; i++)
     {
@@ -737,9 +738,8 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
         if (Stat->Count == 0)
         {
-            printf("0x%02X  %-14s %7s %8s %8s %9s %9s %9s %9s%s\r\n",
-                   MsgDef[i].Id, MsgDef[i].Name,
-                   "-", "-", "-", "-", "-", "-", "-", Tail);
+            printf("0x%02X    %9s %9s %9s %10s %12s %10s %10s%s\r\n",
+                   MsgDef[i].Id, "-", "-", "-", "-", "-", "-", "-", Tail);
 
             continue;
         }
@@ -753,15 +753,15 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
         if (Stat->Count == 1)
         {
-            printf("0x%02X  %-14s %7llu %8s %8s %9.3f %9s %9s %9s%s\r\n",
-                   MsgDef[i].Id, MsgDef[i].Name, Stat->Count,
-                   "-", "-", Stat->LastIntMs, "-", "-", "-", Tail);
+            printf("0x%02X    %9llu %9s %9s %10s %12s %10s %10s%s\r\n",
+                   MsgDef[i].Id, Stat->Count,
+                   "-", "-", "-", "-", "-", "-", Tail);
 
             continue;
         }
 
-        printf("0x%02X  %-14s %7llu %8.2f %8.2f %9.3f %9.3f %9.3f %9.3f%s\r\n",
-               MsgDef[i].Id, MsgDef[i].Name, Stat->Count, AvgHz, Stat->InstHz,
+        printf("0x%02X    %9llu %9.2f %9.2f %10.3f %12.3f %10.3f %10.3f%s\r\n",
+               MsgDef[i].Id, Stat->Count, AvgHz, Stat->InstHz,
                Stat->LastIntMs, AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs, Tail);
     }
 
@@ -882,7 +882,7 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
         }
     }
 
-    /* ---------- 设备时间戳差值Δt统计(每包一行, 数据包2/3/4) ---------- */
+    /* ---------- 设备时间戳差值Δt统计(每包一行, 格式对齐CAN分支0x091) ---------- */
 
     for (i = 0; i < UART_MSG_NUM; i++)
     {
@@ -895,12 +895,14 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 
         if (Tsd->Sample == 0)
         {
-            printf("时间戳Δt(ms) 0x%02X: 等待数据...%s\r\n", MsgDef[i].Id, Tail);
+            printf("0x%02X时间戳差值Δt: 等待第二个0x%02X包...%s\r\n",
+                   MsgDef[i].Id, MsgDef[i].Id, Tail);
 
             continue;
         }
 
-        printf("时间戳Δt(ms) 0x%02X: 最新%.3f/平均%.3f/最小%.3f/最大%.3f(N=%llu)%s\r\n",
+        printf("0x%02X时间戳差值Δt: 最新 %.3f ms, 平均 %.3f ms, "
+               "最小 %.3f ms, 最大 %.3f ms, 样本 %llu%s\r\n",
                MsgDef[i].Id, Tsd->LastDeltaMs,
                Tsd->SumDeltaMs / (double)Tsd->Sample,
                Tsd->MinDeltaMs, Tsd->MaxDeltaMs,
