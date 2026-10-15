@@ -85,7 +85,7 @@ typedef struct
 } UartFrameStat_S;
 
 /** @brief 设备时间戳差值Δt统计(带us时间戳的数据包2/3/4, 与CAN分支0x091同思路)
- *  @note  时间戳回退/重置(差值>1s)视为异常样本丢弃, 只更新基准 */
+ *  @note  全样本无过滤: 时间戳回退/重置等异常直接体现在最小/最大/平均(与CAN分支一致) */
 typedef struct
 {
     unsigned long long Sample;  /* 差值样本数(第2帧起才有) */

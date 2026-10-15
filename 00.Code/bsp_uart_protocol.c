@@ -153,7 +153,7 @@ static int TsOffset(unsigned char Id)
 }
 
 /**
- * @brief 设备时间戳差值Δt更新(无符号相减回绕安全, >1s异常样本丢弃)
+ * @brief 设备时间戳差值Δt更新(无符号相减回绕安全, 全样本无过滤, 与CAN分支0x091一致)
  */
 static void TsDeltaUpdate(int Index, uint64_t TsUs)
 {
@@ -168,19 +168,15 @@ static void TsDeltaUpdate(int Index, uint64_t TsUs)
         return; /* 首帧只有基准, 无差值 */
     }
 
-    /* 无符号相减天然处理正向回绕; 结果>1s视为乱序/重置异常样本, 丢弃不统计
-       (设备us时间戳, 正常流Δt为毫秒级, 1s门限足够宽) */
+    /* Δt = 本包设备时间戳 - 上一包设备时间戳
+       (无符号相减, 回绕时差值仍正确; 全样本进统计,
+        时间戳回退/重置直接体现在最小/最大/平均, 与CAN分支0x091语义一致) */
     {
         uint64_t DiffUs = TsUs - Tsd->PrevUs;
 
         double DeltaMs = (double)DiffUs / 1000.0;
 
         Tsd->PrevUs = TsUs;
-
-        if (DiffUs > 1000000ULL)
-        {
-            return; /* 异常样本: 乱序/计数器重置, 只更新基准 */
-        }
 
         if ((Tsd->Sample == 0) || (DeltaMs < Tsd->MinDeltaMs))
         {
