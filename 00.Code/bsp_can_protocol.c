@@ -93,6 +93,9 @@ static CanFrameStat_S FrameStat[CAN_DATA_FRAME_NUM];
 /** @brief 跨帧收集的IMU数据(Mask==0xFF表示8帧收齐) */
 static CanImuData_S ImuData;
 
+/** @brief 0x091设备时间戳差值统计与曲线样本 */
+static CanTsDelta_S TsDelta;
+
 /*===========================================================
 =                       外部接口
 ===========================================================*/
@@ -283,8 +286,47 @@ int BspCanProtocolOnFrame(const struct can_frame *pFrame)
         switch (Index)
         {
             case 0: /* 0x091: 时间戳 uint64, 独占8字节 */
-                ImuData.Timestamp = CanGetU64LE(pData);
-                break;
+            {
+                unsigned long long Ts = CanGetU64LE(pData);
+
+                ImuData.Timestamp = Ts;
+
+                /* 设备时间戳差值: Δt = 本帧时间戳 - 上一帧时间戳
+                   (us转ms; 无符号减法, 时间戳回绕时差值仍正确) */
+                if (TsDelta.HasPrev)
+                {
+                    double Dms = (double)(Ts - TsDelta.PrevUs) / 1000.0;
+
+                    if ((TsDelta.Count == 0) || (Dms < TsDelta.MinDeltaMs))
+                    {
+                        TsDelta.MinDeltaMs = Dms;
+                    }
+
+                    if ((TsDelta.Count == 0) || (Dms > TsDelta.MaxDeltaMs))
+                    {
+                        TsDelta.MaxDeltaMs = Dms;
+                    }
+
+                    TsDelta.SumDeltaMs += Dms;
+
+                    TsDelta.LastDeltaMs = Dms;
+
+                    TsDelta.Count++;
+
+                    /* 样本入环形区, 供主线程绘制最近样本曲线 */
+                    TsDelta.Ring[TsDelta.RingHead] = Dms;
+
+                    TsDelta.RingHead =
+                        (TsDelta.RingHead + 1) & (CAN_TS_RING_SIZE - 1);
+                }
+                else
+                {
+                    TsDelta.HasPrev = 1; /* 首帧: 只记录, 无差值 */
+                }
+
+                TsDelta.PrevUs = Ts;
+            }
+            break;
 
             case 1: /* 0x092: Roll(byte0~3) Pitch(byte4~7) */
                 ImuData.Attitude[0] = CanGetFloatLE(pData);
@@ -343,6 +385,14 @@ const CanFrameStat_S *BspCanProtocolGetStat(unsigned int Index)
     }
 
     return &FrameStat[Index];
+}
+
+/**
+ * @brief 获取0x091设备时间戳差值统计(只读)
+ */
+const CanTsDelta_S *BspCanProtocolGetTsDelta(void)
+{
+    return &TsDelta;
 }
 
 /**
@@ -489,6 +539,116 @@ void BspCanProtocolPrintStat(double ElapsedSec, int Tty)
 
             default:
                 break;
+        }
+    }
+
+    /* ---------- 0x091设备时间戳差值曲线区 ---------- */
+
+    printf("\r\n0x091设备时间戳差值Δt (最近%d包, 横轴每字符≈1包; 量程以最新样本自适应)%s\r\n",
+           CAN_TS_RING_SIZE, Tail);
+
+    {
+        const CanTsDelta_S *Td = &TsDelta;
+
+        unsigned int n;
+
+        double Vmin = 0.0;
+
+        double Vmax = 0.0;
+
+        /* 取窗口内样本自适应量程(样本不足时退化为[0, 2ms]) */
+        if (Td->Count > 0)
+        {
+            Vmin = Td->Ring[0];
+
+            Vmax = Td->Ring[0];
+
+            for (n = 1; n < CAN_TS_RING_SIZE; n++)
+            {
+                if (Td->Ring[n] < Vmin)
+                {
+                    Vmin = Td->Ring[n];
+                }
+
+                if (Td->Ring[n] > Vmax)
+                {
+                    Vmax = Td->Ring[n];
+                }
+            }
+
+            if (Vmax - Vmin < 0.2)
+            {
+                double Mid = (Vmax + Vmin) / 2.0;
+
+                Vmin = Mid - 0.1;
+
+                Vmax = Mid + 0.1;
+            }
+        }
+
+        /* 横向绘图: 每个样本一列, 行=量程分桶, 时间从左到右越新越靠右 */
+        for (n = 0; n < CAN_PLOT_HEIGHT; n++)
+        {
+            unsigned int k;
+
+            /* 自上而下: 首行为量程顶部, 末行为量程底部 */
+            double Hi = Vmax - (Vmax - Vmin) * (double)n / (double)CAN_PLOT_HEIGHT;
+
+            double Lo = Vmax - (Vmax - Vmin) * (double)(n + 1) / (double)CAN_PLOT_HEIGHT;
+
+            putchar(n == 0 ? '|' : ' ');
+
+            for (k = 0; k < CAN_TS_RING_SIZE; k++)
+            {
+                /* 环形展开: 最老样本在左, 最新样本在右 */
+                double V = Td->Ring[(Td->RingHead + k) & (CAN_TS_RING_SIZE - 1)];
+
+                if (Td->Count == 0)
+                {
+                    putchar(' ');
+                }
+                else if ((V >= Lo) && (V < Hi))
+                {
+                    putchar('*');
+                }
+                else if (n == CAN_PLOT_HEIGHT - 1)
+                {
+                    putchar('_'); /* 底线: 样本未覆盖的列 */
+                }
+                else
+                {
+                    putchar(' ');
+                }
+            }
+
+            if (n == 0)
+            {
+                printf("| max %.3f ms%s", Vmax, Tail);
+            }
+            else if (n == CAN_PLOT_HEIGHT / 2)
+            {
+                printf("| mid %.3f ms%s", (Vmax + Vmin) / 2.0, Tail);
+            }
+            else if (n == CAN_PLOT_HEIGHT - 1)
+            {
+                printf("| min %.3f ms%s", Vmin, Tail);
+            }
+            else
+            {
+                printf("|%s", Tail);
+            }
+        }
+
+        /* 曲线下统计行: Δt = 当前包时间戳-上一包时间戳 */
+        if (Td->Count > 0)
+        {
+            printf("Δt统计: 最新 %.3f ms, 平均 %.3f ms, 最小 %.3f ms, 最大 %.3f ms, 样本 %llu%s\r\n",
+                   Td->LastDeltaMs, Td->SumDeltaMs / (double)Td->Count,
+                   Td->MinDeltaMs, Td->MaxDeltaMs, Td->Count, Tail);
+        }
+        else
+        {
+            printf("Δt统计: 等待第二个0x091包...%s\r\n", Tail);
         }
     }
 

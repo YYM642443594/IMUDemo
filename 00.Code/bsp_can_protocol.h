@@ -72,6 +72,13 @@ extern "C"
 /** @brief 数据报文每帧字节数(协议固定DLC=8) */
 #define CAN_DATA_FRAME_DLC 8
 
+/** @brief 0x091设备时间戳差值环形样本数(必须为2的幂)
+ *  曲线窗口: 最近64个0x091帧的Δt(1000Hz下约64ms) */
+#define CAN_TS_RING_SIZE 64
+
+/** @brief Δt曲线行数 */
+#define CAN_PLOT_HEIGHT 8
+
     /* CAN交互指令ID(见协议文档3.3.3章节) */
 
 /** @brief CAN数据流输出状态设置与查询指令(用于开启/关闭推送) */
@@ -102,6 +109,29 @@ extern "C"
         unsigned char LastData[CAN_DATA_FRAME_DLC]; /* 最新一帧原始数据 */
         unsigned char LastDlc;         /* 最新一帧DLC */
     } CanFrameStat_S;
+
+    /**
+     * @brief 0x091设备时间戳差值统计与曲线样本
+     *
+     * Δt = 本帧0x091载荷时间戳 - 上一帧0x091载荷时间戳(ms),
+     * 反映设备内部时钟的推进节奏, 与主机接收间隔(当前ms)相互独立:
+     * 两者接近说明设备按真实节奏推流;
+     * 接收间隔正常但Δt为0/跳变, 说明设备时间戳本身异常。
+     *
+     * Ring/RingHead由解析线程单写, 主线程只读(显示用, 允许瞬时竞态)。
+     */
+    typedef struct
+    {
+        unsigned long long Count;       /* Δt样本数(=有效相邻对数) */
+        double LastDeltaMs;             /* 最新Δt (ms) */
+        double MinDeltaMs;              /* Δt最小值 (ms) */
+        double MaxDeltaMs;              /* Δt最大值 (ms) */
+        double SumDeltaMs;              /* Δt累计 (ms), 求平均用 */
+        unsigned long long PrevUs;      /* 上一帧设备时间戳 (us) */
+        unsigned char HasPrev;          /* 已收到过首帧标志 */
+        double Ring[CAN_TS_RING_SIZE];  /* Δt环形样本区(曲线绘制用) */
+        volatile unsigned int RingHead; /* 下一写入下标(解析线程更新) */
+    } CanTsDelta_S;
 
     /**
      * @brief IMU数据集合(一组完整数据 = 8个CAN报文)
@@ -181,6 +211,13 @@ extern "C"
      * @return const CanFrameStat_S* 统计结构指针(内部静态存储)
      */
     const CanFrameStat_S *BspCanProtocolGetStat(unsigned int Index);
+
+    /**
+     * @brief 获取0x091设备时间戳差值统计(只读)
+     *
+     * @return const CanTsDelta_S* 统计结构指针(内部静态存储)
+     */
+    const CanTsDelta_S *BspCanProtocolGetTsDelta(void);
 
     /**
      * @brief 打印统计表格 + 各报文最新帧解析值

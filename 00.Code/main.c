@@ -361,8 +361,10 @@ int main(int argc, char *argv[])
             {
                 if (Tty && !FirstPrint)
                 {
-                    /* 回退到统计表格首行, 覆盖重绘(表格10行+空行+解析区10行) */
-                    printf("\033[%dA", 2 * CAN_DATA_FRAME_NUM + 4);
+                    /* 回退到统计表格首行, 覆盖重绘
+                       (表头2行+表格8行+空行+解析表头+解析8行
+                        +空行+曲线标题+曲线8行+Δt统计1行) */
+                    printf("\033[%dA", 2 * CAN_DATA_FRAME_NUM + 10);
                 }
 
                 BspCanProtocolPrintStat(Now - G_StartSec, Tty);
@@ -418,6 +420,19 @@ int main(int argc, char *argv[])
                        "平均间隔 %.3f ms [min %.3f / max %.3f]\r\n",
                        CAN_DATA_ID_BASE + i, Stat->Count, AvgHz,
                        Stat->LastIntMs, AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs);
+            }
+        }
+
+        /* 0x091设备时间戳差值汇总 */
+        {
+            const CanTsDelta_S *Td = BspCanProtocolGetTsDelta();
+
+            if (Td->Count > 0)
+            {
+                printf("0x091时间戳差值Δt: 最新 %.3f ms, 平均 %.3f ms, "
+                       "最小 %.3f ms, 最大 %.3f ms, 样本 %llu\r\n",
+                       Td->LastDeltaMs, Td->SumDeltaMs / (double)Td->Count,
+                       Td->MinDeltaMs, Td->MaxDeltaMs, Td->Count);
             }
         }
 
