@@ -707,9 +707,10 @@ const UartFrameStat_S *BspUartProtocolGetStat(unsigned int Index)
  * @brief 打印统计表格+各包最新帧解析值(固定行数, 见UART_STAT_PRINT_LINES)
  *
  * @note 终端模式下总行数固定: 表头2+表格4+空行1+解析表头1+解析20行
- *       (包1=6/包2=4/包3=7/包4=3)=28行, 上层每次打印后配合\033[28A
- *       回退实现原地刷新; 未收到数据的包在表格行用"-"占位、解析区用
- *       "等待数据..."占位, 保证任何时刻输出行数一致不串行
+ *       (包1=6/包2=4/包3=7/包4=3)+Δt统计3行(数据包2/3/4每包一行)=31行,
+ *       上层每次打印后配合\033[31A回退实现原地刷新; 未收到数据的包在
+ *       表格行用"-"占位、解析区/Δt行用"等待数据..."占位, 保证任何时刻
+ *       输出行数一致不串行
  */
 void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
 {
@@ -881,37 +882,30 @@ void BspUartProtocolPrintStat(double ElapsedSec, int Tty)
         }
     }
 
-    /* ---------- 设备时间戳差值Δt统计(1行, 数据包2/3/4) ---------- */
-    printf("时间戳Δt(ms):");
+    /* ---------- 设备时间戳差值Δt统计(每包一行, 数据包2/3/4) ---------- */
 
+    for (i = 0; i < UART_MSG_NUM; i++)
     {
-        int Printed = 0;
+        const UartTsDelta_S *Tsd = &TsDelta[i];
 
-        for (i = 0; i < UART_MSG_NUM; i++)
+        if (TsOffset(MsgDef[i].Id) < 0)
         {
-            const UartTsDelta_S *Tsd = &TsDelta[i];
-
-            if ((TsOffset(MsgDef[i].Id) < 0) || (Tsd->Sample == 0))
-            {
-                continue;
-            }
-
-            printf(" 0x%02X 最新%.3f/平均%.3f/最小%.3f/最大%.3f(N=%llu)",
-                   MsgDef[i].Id, Tsd->LastDeltaMs,
-                   Tsd->SumDeltaMs / (double)Tsd->Sample,
-                   Tsd->MinDeltaMs, Tsd->MaxDeltaMs,
-                   Tsd->Sample);
-
-            Printed = 1;
+            continue;
         }
 
-        if (Printed == 0)
+        if (Tsd->Sample == 0)
         {
-            printf(" 等待数据...");
+            printf("时间戳Δt(ms) 0x%02X: 等待数据...%s\r\n", MsgDef[i].Id, Tail);
+
+            continue;
         }
+
+        printf("时间戳Δt(ms) 0x%02X: 最新%.3f/平均%.3f/最小%.3f/最大%.3f(N=%llu)%s\r\n",
+               MsgDef[i].Id, Tsd->LastDeltaMs,
+               Tsd->SumDeltaMs / (double)Tsd->Sample,
+               Tsd->MinDeltaMs, Tsd->MaxDeltaMs,
+               Tsd->Sample, Tail);
     }
-
-    printf("%s\r\n", Tail);
 
     fflush(stdout);
 }

@@ -40,9 +40,9 @@
 #define UART_FRAME_DATA_MAX 255
 #define UART_FRAME_MAX_LEN  (UART_FRAME_HEAD_LEN + UART_FRAME_DATA_MAX + UART_FRAME_CRC_LEN)
 
-/** @brief 统计打印块固定行数(表头2+表格4+空行+解析表头+4包解析20行+Δt统计1行),
+/** @brief 统计打印块固定行数(表头2+表格4+空行+解析表头+4包解析20行+Δt统计3行),
  *         终端原地刷新用: 每次打印后回退该行数覆盖重绘 */
-#define UART_STAT_PRINT_LINES 29
+#define UART_STAT_PRINT_LINES 31
 
 /** @brief 帧同步状态机状态 */
 typedef enum
