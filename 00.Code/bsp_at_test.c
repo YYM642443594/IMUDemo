@@ -2,8 +2,8 @@
  *******************************************************************************
  * @file    bsp_at_test.c
  * @author  杨镒铭
- * @version V1.3.1
- * @date    2026-10-15
+ * @version V1.4.0
+ * @date    2026-10-20
  * @brief   志翔IMU AT指令逐条验证器
  *
  * @detail
@@ -21,6 +21,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.4.0<td>2026-10-20<td>杨镒铭<td>补齐文档指令覆盖: 新增CANBAUD?查询与DATALINK/MSGID=13/PPSMODE/ZEROBIASCAL风险组(成对自动还原); DATATIME=设置先查原时间验证后自动还原; RST复位重启置表末
  * <tr><td>V1.3.1<td>2026-10-15<td>杨镒铭<td>输出整理: 每条一行+末尾汇总表; 修数据流混流假FAIL(全缓冲搜OK+过滤二进制); 修banner字面转义
  * <tr><td>V1.3.0<td>2026-10-15<td>杨镒铭<td>创建: 安全组13查询+SET/YAWRESET, 风险组成对验证自动还原
  *   </table>
@@ -52,7 +53,8 @@
 typedef enum
 {
     AT_T_QUERY = 0,   /* 查询类: 匹配应答模式+OK */
-    AT_T_ACTION       /* 动作类: 应答OK即过 */
+    AT_T_ACTION,      /* 动作类: 应答OK即过 */
+    AT_T_TIMESET      /* 时间设置类: 先存原时间, 验证后还原(掉电不保存) */
 } AtCaseType_E;
 
 /** @brief 风险等级 */
@@ -103,6 +105,7 @@ static AtCase_S G_Cases[] =
     { "AT+DATALINK?",   AT_T_QUERY, AT_G_SAFE, "数据链路查询",      NULL, "DATALINK" },
     { "AT+GRAPHRQ?",    AT_T_QUERY, AT_G_SAFE, "主图推送频率查询",  NULL, "DataPushFre:" },
     { "AT+ORIGRQ?",     AT_T_QUERY, AT_G_SAFE, "原始数据频率查询",  NULL, "DataPushFre:" },
+    { "AT+CANBAUD?",    AT_T_QUERY, AT_G_SAFE, "CAN波特率查询",     NULL, "CANBaudRate:" },
 
     /* ---------- 安全组: 无持久副作用的动作 ---------- */
     { "AT+SET=OFF",     AT_T_ACTION, AT_G_SAFE, "关数据流", "AT+SET=ON", "" },
@@ -119,6 +122,22 @@ static AtCase_S G_Cases[] =
     /* 独立还原项: 非紧邻成对, 由表内还原扫描执行(不计分) */
     { "AT+GRAPHRQ=20",  AT_T_ACTION, AT_G_RISK, "还原主图频率20Hz", NULL, "" },
     { "AT+ORIGRQ=20",   AT_T_ACTION, AT_G_RISK, "还原原始频率20Hz", NULL, "" },
+
+    /* ---------- 补齐文档覆盖: 链路/报文/PPS模式/零偏 成对验证自动还原 ---------- */
+    { "AT+DATALINK=UART,0", AT_T_ACTION, AT_G_RISK, "关用户UART推送",   "AT+DATALINK=UART,1", "" },
+    { "AT+DATALINK=UART,1", AT_T_ACTION, AT_G_RISK, "还原用户UART推送", NULL, "" },
+    { "AT+MSGID=13,0",      AT_T_ACTION, AT_G_RISK, "关0x0013推送",     "AT+MSGID=13,1", "" },
+    { "AT+MSGID=13,1",      AT_T_ACTION, AT_G_RISK, "还原0x0013推送",   NULL, "" },
+    { "AT+PPSMODE=1",       AT_T_ACTION, AT_G_RISK, "PPS模式配1",       "AT+PPSMODE=2", "" },
+    { "AT+PPSMODE=2",       AT_T_ACTION, AT_G_RISK, "还原PPS模式2",     NULL, "" },
+    { "AT+ZEROBIASCAL=ON",  AT_T_ACTION, AT_G_RISK, "零偏校准(需静止)", "AT+ZEROBIASCAL=OFF", "" },
+    { "AT+ZEROBIASCAL=OFF", AT_T_ACTION, AT_G_RISK, "关零偏校准",       NULL, "" },
+
+    /* 时间设置: 掉电不保存, 先查原时间, 验证后自动还原, 避免改动设备时间 */
+    { "AT+DATATIME=2026 1 1-00:00:00", AT_T_TIMESET, AT_G_RISK, "设置系统时间(还原原时间)", NULL, "" },
+
+    /* 复位重启: 会断流数秒, 固定放用例表末尾最后执行 */
+    { "AT+RST",             AT_T_ACTION, AT_G_RISK, "复位重启",         NULL, "" },
 };
 
 #define CASE_NUM (sizeof(G_Cases) / sizeof(G_Cases[0]))
@@ -352,6 +371,122 @@ static void ExtractVals(const char *pResp, const char *Expect, char *pVals, int 
 }
 
 /**
+ * @brief 原时间应答值转设置格式: "2026-7-23 15:36:10" -> "2026 7 23-15:36:10"
+ *
+ * @return 1=转换成功(含两段日期分隔) 0=格式异常
+ */
+static int TimeToSetFmt(const char *pSrc, char *pDst, int Size)
+{
+    int n = 0;
+
+    int Dash = 0;
+
+    for (; (pSrc[n] != '\0') && (n < (Size - 1)); n++)
+    {
+        char c = pSrc[n];
+
+        if ((c == '-') && (Dash < 2))
+        {
+            c = ' ';
+
+            Dash++;
+        }
+
+        pDst[n] = c;
+    }
+
+    pDst[n] = '\0';
+
+    {
+        char *p = strrchr(pDst, ' ');
+
+        if (p != NULL)
+        {
+            *p = '-'; /* 日期与时间的分隔空格改'-' */
+        }
+    }
+
+    return (Dash == 2);
+}
+
+/**
+ * @brief 时间设置类用例: 先查原时间 -> 写测试时间 -> 还原原时间
+ *
+ * @note  该指令掉电不保存, 但仍还原, 避免验证期间设备时间被改动
+ */
+static void RunTimeSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
+{
+    static char Resp[AT_RESP_MAX];
+
+    char Orig[32];
+
+    char SetFmt[32];
+
+    char Restore[AT_LINE_MAX];
+
+    const char *p;
+
+    int i;
+
+    /* 1. 查询原时间, 取不到则不动设备时间 */
+    if ((AtSend(pDrv, "AT+DATATIME?") != 0) ||
+        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0) ||
+        ((p = strstr(Resp, "DataTime:")) == NULL))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "查询原时间失败, 跳过以免改设备时间");
+
+        return;
+    }
+
+    p += strlen("DataTime:");
+
+    for (i = 0; (i < (int)sizeof(Orig) - 1) &&
+                (p[i] != '\0') && (p[i] != '\r') && (p[i] != '\n'); i++)
+    {
+        Orig[i] = p[i];
+    }
+
+    Orig[i] = '\0';
+
+    if ((TimeToSetFmt(Orig, SetFmt, (int)sizeof(SetFmt)) == 0) || (SetFmt[0] == '\0'))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "原时间格式异常: %s", Orig);
+
+        return;
+    }
+
+    /* 2. 写测试时间 */
+    if (AtSend(pDrv, pCase->Cmd) != 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "发送失败");
+
+        return;
+    }
+
+    if (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "设置测试时间未收到OK");
+
+        return;
+    }
+
+    /* 3. 还原原时间 */
+    snprintf(Restore, sizeof(Restore), "AT+DATATIME=%s", SetFmt);
+
+    if ((AtSend(pDrv, Restore) != 0) ||
+        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "还原原时间失败(原:%s)", Orig);
+
+        return;
+    }
+
+    snprintf(pRes->Vals, sizeof(pRes->Vals), "已还原原时间:%s", Orig);
+
+    pRes->Pass = 1;
+}
+
+/**
  * @brief 执行单条用例(安静模式, 不打印过程)
  */
 static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
@@ -363,6 +498,13 @@ static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
     pRes->Note[0] = '\0';
 
     pRes->Done = 1;
+
+    if (pCase->Type == AT_T_TIMESET)
+    {
+        RunTimeSetCase(pDrv, pCase, pRes);
+
+        return;
+    }
 
     if (AtSend(pDrv, pCase->Cmd) != 0)
     {
@@ -450,7 +592,7 @@ int main(int argc, char *argv[])
 
     InstallSignal(SIGTERM);
 
-    printf("===== AT指令验证器 V1.3.1 (设备 %s @%d, %s) =====\n",
+    printf("===== AT指令验证器 V1.4.0 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)

@@ -1,3 +1,4 @@
 uart_stat
+at_test
 can_stat
 *.o

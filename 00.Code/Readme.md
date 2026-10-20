@@ -76,9 +76,9 @@ gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
 
 | 组别 | 内容 | 判定 | 副作用处理 |
 |---|---|---|---|
-| 安全组 | 13 条只读查询 + 数据流开关 + YAW归零 | 查询类按文档应答格式逐项匹配（如 `AppVersion:`/`UARTBaudRate:` + `OK`）；动作类收到 `OK` 即过 | SET 开关成对执行后恢复原态；YAW 归零为一次性动作 |
-| 风险组 | PPS 开关、MSGID=22 推送开关、GRAPHRQ/ORIGRQ 频率 | 同上 | **成对设计：先验证设置，紧接下发还原指令**（如 PPS=ON→PPS=OFF，MSGID=22,1→22,0），无成对项则告警提示手动检查 |
-| 暂不内置 | BAUD/COORDINATE/PUSHFRQ 等掉电保存且影响链路或数据语义的项 | — | 改波特率会使本工具失联、改坐标系影响数据判读，避免在自动流程中执行；如需验证建议手动单项进行 |
+| 安全组 | 14 条只读查询（含 `CANBAUD?`）+ 数据流开关 + YAW归零 | 查询类按文档应答格式逐项匹配（如 `AppVersion:`/`UARTBaudRate:` + `OK`）；动作类收到 `OK` 即过 | SET 开关成对执行后恢复原态；YAW 归零为一次性动作 |
+| 风险组 | PPS 开关与模式、MSGID=13/22 推送开关、GRAPHRQ/ORIGRQ 频率、DATALINK 链路开关、零偏校准、系统时间设置、RST 复位 | 同上 | **成对设计：先验证设置，紧接下发还原指令**（如 PPS=ON→PPS=OFF，DATALINK=UART,0→UART,1）；`DATATIME=` 先查原时间、验证后自动还原原时间（掉电不保存）；`RST` 复位重启固定放用例表末尾 |
+| 暂不内置 | BAUD/COORDINATE/PUSHFRQ/CANBAUD= 等掉电保存且影响链路或数据语义的项 | — | 改波特率会使本工具失联、改坐标系影响数据判读、改推送频率改变数据流语义，避免在自动流程中执行；如需验证建议手动单项进行 |
 
 超时 800ms 无 `OK` 判 FAIL；数据流推送报文与 AT 应答共存于同一串口，工具按"完整 `OK\r\n` 结尾"提取应答，原始应答片段原样打印便于人工复核。
 
@@ -128,3 +128,4 @@ gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
 7. 版本：V1.2.1（2026-10-15）—— 修复终端模式刷新堆叠：每次整块回退覆盖重绘（统计表+解析+Δt 共 31 行一起原地位移），统计行改默认 \r 起始+清行尾（残留长行不再顶乱表格列）
 8. 版本：V1.3.0（2026-10-15）—— 新增 AT 指令逐条验证器 at_test（安全组13查询+开关动作 / 风险组成对验证自动还原），run.sh 升级为功能选择菜单（1=uart_stat / 2=at_test）
 9. 版本：V1.3.1（2026-10-15）—— at_test 输出整理：每条指令一行（发送过程不再刷屏），结束后输出对齐的汇总表（序号/指令/结果/提取值），末尾单列失败清单；修真机混流假FAIL：应答过滤二进制噪声后全缓冲搜 `OK\r\n`（OK 被数据流分块打断不再漏判）；修 Ctrl-C 无响应（drv_serial read EINTR 自旋吞信号 → 改 VMIN=0/VTIME=1 半阻塞读 + sigaction 无 SA_RESTART）
+10. 版本：V1.4.0（2026-10-20）—— at_test 补齐《用户协议》第2章指令覆盖：新增 `AT+CANBAUD?` 查询（安全组14条）、`AT+DATALINK=UART,0`/`AT+MSGID=13,0`/`AT+PPSMODE=1`/`AT+ZEROBIASCAL=ON` 风险组用例（成对自动还原）；`AT+DATATIME=` 设置类先查原时间、验证后自动还原；`AT+RST` 复位重启置用例表末执行；至此除 `BAUD=`/`COORDINATE=`/`PUSHFRQ=`/`CANBAUD=` 四条有意排除项外全量覆盖
