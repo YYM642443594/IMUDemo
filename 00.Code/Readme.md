@@ -1,13 +1,14 @@
-# `IMU Linux` 串口验证程序 (uart_stat + at_test)
+# `IMU Linux` 串口验证程序 (uart_stat + at_test + hex_test)
 
 [TOC]
 
 ## 概述
 
-	本项目是基于志翔`IMU`的 Linux 串口**测试验证程序集**，参照 `feature/LinuxCanTestVerifDemo` 分支的统计方式与三层架构（驱动/队列/协议），包含两个工具：
+	本项目是基于志翔`IMU`的 Linux 串口**测试验证程序集**，参照 `feature/LinuxCanTestVerifDemo` 分支的统计方式与三层架构（驱动/队列/协议），包含三个工具：
 
 	- **uart_stat**：数据流验证 —— 接收志翔私有协议推送报文，实现数据包1/2/3/4 的帧级统计与解析，验证帧率是否达标、间隔是否均匀、有无断流、物理量解析正确性。
 	- **at_test**：AT指令验证 —— 依据《用户协议》第2章逐条下发 AT 指令并按文档应答格式判定，验证完成后自动还原配置。
+	- **hex_test**：HEX协议验证 —— 依据《用户协议》第3.2章串口交互协议，对全部报文 ID 逐一下发查询/写入帧并按应答格式判定（Len/CRC/值域），写 RAM 项验证后依据查询缓存自动还原。
 
 ## 功能特性
 
@@ -39,7 +40,8 @@
 ├── bsp_uart_queue.c/h     # 字节流SPSC环形队列模块（4KB）
 ├── bsp_uart_protocol.c/h  # 协议层：帧同步/CRC16/统计/数据包1~4解析
 ├── bsp_at_test.c          # AT指令逐条验证器（查询/动作分组，配置自动还原）
-├── run.sh                 # 一键编译运行脚本（菜单选择 uart_stat / at_test）
+├── bsp_hex_test.c         # HEX交互协议逐报文验证器（3.2章全ID覆盖，RAM配置自动还原）
+├── run.sh                 # 一键编译运行脚本（菜单选择 uart_stat / at_test / hex_test）
 └── Readme.md              # 项目说明文档
 ```
 
@@ -55,7 +57,7 @@ UartRecvThread(生产者)  --字节流-->  UartQueue  --字节流-->  UartParseT
 ## 构建与运行
 
 ```bash
-# 一键编译并弹出功能菜单（1=数据流统计 uart_stat / 2=AT指令验证 at_test）（默认 /dev/ttyUSB0 @921600）
+# 一键编译并弹出功能菜单（1=数据流统计 uart_stat / 2=AT指令验证 at_test / 3=HEX协议验证 hex_test）（默认 /dev/ttyUSB0 @921600）
 ./run.sh
 
 # 指定串口/波特率/限时10秒
@@ -64,11 +66,14 @@ UartRecvThread(生产者)  --字节流-->  UartQueue  --字节流-->  UartParseT
 # 手动编译
 gcc -O2 -Wall -o uart_stat main.c drv_serial.c bsp_uart_queue.c bsp_uart_protocol.c -lpthread
 gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
+gcc -O2 -Wall -o hex_test bsp_hex_test.c drv_serial.c -lpthread
 ```
 
 用法：`./uart_stat [串口设备] [波特率] [持续秒数]`，持续秒数 0 或缺省=直到 Ctrl-C。
 
 用法：`./at_test [串口设备] [波特率] [模式]`，模式 0=仅安全组（默认），1=安全组+风险组（改配置项验证后自动还原）。
+
+用法：`./hex_test [串口设备] [波特率] [模式]`，模式含义同 at_test。
 
 ## AT指令验证说明 (at_test)
 
@@ -81,6 +86,18 @@ gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
 | 暂不内置 | BAUD/COORDINATE/PUSHFRQ/CANBAUD= 等掉电保存且影响链路或数据语义的项 | — | 改波特率会使本工具失联、改坐标系影响数据判读、改推送频率改变数据流语义，避免在自动流程中执行；如需验证建议手动单项进行 |
 
 超时 800ms 无 `OK` 判 FAIL；数据流推送报文与 AT 应答共存于同一串口，工具按"完整 `OK\r\n` 结尾"提取应答，原始应答片段原样打印便于人工复核。
+
+## HEX协议验证说明 (hex_test)
+
+依据《用户协议》第3.2章串口交互协议验证，覆盖 3.2.2 报文 ID 表全部 16 个 ID 及 3.2.3 详述的 0x0020 零偏校准、0x0021 YAW 归零（共 18 个）。帧格式 `AA 55 | CMD(ID高字节) | ID | Op | Len(2,小端,整帧长) | DATA | CRC16(2,小端)`，应答帧无 Op 字段；CRC16 初值 `0x3692`、多项式 `0x8408`（反向），范围=帧头至数据域末，与 uart_stat 的 BspUartCrc16 同算法。
+
+| 组别 | 内容 | 判定 | 副作用处理 |
+|---|---|---|---|
+| 安全组 | 11 个 ID 的查询（0x0003版本/0x0004频率/0x0006算法模式/0x0007推送状态/0x0012PPS/0x0015坐标系/0x0016串口波特率/0x0017CAN波特率/0x0018SN/0x0101A值/0x0103电量）+ 0x0021 YAW 归零（写 RAM 掉电不保存） | 应答帧 CRC 校验通过后按文档应答格式校验：数据域长度、值域白名单（频率档 0x01~0x09、坐标系 24 值表、波特率 7 值表、CAN 波特率 3 值表、SN 16 字节可打印）并提取关键值 | 查询结果同步缓存（频率档/算法模式/推送状态/PPS 开关与模式/坐标系），供风险组动态构造设置值与还原帧 |
+| 风险组 | 写 RAM（Op=0x01）：0x0004 频率、0x0006 算法模式、0x0007 推送开关、0x0011 报文推送开关（0x0022）、0x0012 PPS 开关、0x0015 坐标系、0x0008 磁力计校准、0x0020 零偏校准、0x0019 时间同步 | 应答 DATA[0]==0x00 即过 | **动态成对还原：设置值避让原值（如频率原档 10Hz 则设 20Hz），验证通过后立即用查询缓存构造还原帧下发（不计分）**；0x0019 时间同步写入主机当前时间（掉电不保存）；0x0014 复位重启固定放用例表末尾 |
+| 有意排除 | 蓝牙名称 0x0005 写入（直接写蓝牙且掉电保存，无法还原）；0x0016/0x0017 写入（仅支持配置到 FLASH 且重启生效会断链）；各 ID 的 FLASH 档（Op=0x02，掉电保存）；0x0019 的"设原时间还原"（无查询报文，改为同步主机时间覆盖） | — | 如需验证建议手动单项进行 |
+
+接收与数据流混流容错：滑窗搜索帧头 + CMD/ID 匹配 + CRC 校验，推送报文（如 0x0001）与坏帧自动剔除；每次事务前 `tcflush` 清残留。模式 0 仅安全组（默认），模式 1 加风险组；查询缓存无效时风险项自动 SKIP（避免无法还原）。
 
 ## 实时输出说明
 
@@ -129,3 +146,4 @@ gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
 8. 版本：V1.3.0（2026-10-15）—— 新增 AT 指令逐条验证器 at_test（安全组13查询+开关动作 / 风险组成对验证自动还原），run.sh 升级为功能选择菜单（1=uart_stat / 2=at_test）
 9. 版本：V1.3.1（2026-10-15）—— at_test 输出整理：每条指令一行（发送过程不再刷屏），结束后输出对齐的汇总表（序号/指令/结果/提取值），末尾单列失败清单；修真机混流假FAIL：应答过滤二进制噪声后全缓冲搜 `OK\r\n`（OK 被数据流分块打断不再漏判）；修 Ctrl-C 无响应（drv_serial read EINTR 自旋吞信号 → 改 VMIN=0/VTIME=1 半阻塞读 + sigaction 无 SA_RESTART）
 10. 版本：V1.4.0（2026-10-20）—— at_test 补齐《用户协议》第2章指令覆盖：新增 `AT+CANBAUD?` 查询（安全组14条）、`AT+DATALINK=UART,0`/`AT+MSGID=13,0`/`AT+PPSMODE=1`/`AT+ZEROBIASCAL=ON` 风险组用例（成对自动还原）；`AT+DATATIME=` 设置类先查原时间、验证后自动还原；`AT+RST` 复位重启置用例表末执行；至此除 `BAUD=`/`COORDINATE=`/`PUSHFRQ=`/`CANBAUD=` 四条有意排除项外全量覆盖
+11. 版本：V1.5.0（2026-10-20）—— 新增 HEX 交互协议逐报文验证器 hex_test（bsp_hex_test.c）：依据《用户协议》第3.2章覆盖全部 18 个报文 ID（3.2.2 表 16 个 + 0x0020/0x0021），安全组 11 查询+YAW 归零、风险组写 RAM 动态成对还原（查询缓存避让原值构造设置帧与还原帧）、时间同步主机时间、复位置表末；有意排除掉电保存与断链类（蓝牙名称/波特率写入/FLASH 档）；run.sh 菜单升级为 1=uart_stat / 2=at_test / 3=hex_test
