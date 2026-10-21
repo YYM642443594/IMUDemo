@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_at_test.c
  * @author  杨镒铭
- * @version V1.6.0
+ * @version V1.6.1
  * @date    2026-10-21
  * @brief   志翔IMU AT指令逐条验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -21,6 +21,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.1<td>2026-10-21<td>杨镒铭<td>修真机量程查询假FAIL: 应答与推送帧字节级交织致关键字被打断/假OK提前截断 -> 接收路径先按帧结构整帧剔除AA55推送帧, 且要求"全部关键字+OK"双条件齐备才截断(假OK继续等真应答); 超时时有OK仍交上层按关键字判定
  * <tr><td>V1.6.0<td>2026-10-21<td>杨镒铭<td>补文档新增量程配置覆盖: ACCSCALECFG/GYROSCALECFG查询(安全组)+设置(风险组, 查原值设避让档后还原原值)
  * <tr><td>V1.5.0<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspAtTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
  * <tr><td>V1.4.0<td>2026-10-20<td>杨镒铭<td>补齐文档指令覆盖: 新增CANBAUD?查询与DATALINK/MSGID=13/PPSMODE/ZEROBIASCAL风险组(成对自动还原); DATATIME=设置先查原时间验证后自动还原; RST复位重启置表末
@@ -228,23 +229,80 @@ static int AtSend(DrvSerial_S *pDrv, const char *Cmd)
 }
 
 /**
- * @brief 收应答直到超时: 过滤不可见字节(数据流二进制噪声), 全缓冲搜索OK判定结束
+ * @brief 逗号分隔关键字是否全部出现在[pStart, pEnd)区间内
  *
- * @return 1=收到OK(缓冲截断到OK之后) 0=超时未收到
+ * @note  用于应答截断判定: 假OK(数据流噪声)之前不含全部关键字时不应截断
  */
-static int AtRecvResp(DrvSerial_S *pDrv, char *pResp, double TimeoutMs)
+static int KeysAllBefore(const char *pResp, const char *pExpectKeys, const char *pEnd)
 {
-    unsigned char Buf[512];
+    char Tmp[AT_LINE_MAX];
+
+    char *Tok;
+
+    if ((pExpectKeys == NULL) || (pExpectKeys[0] == '\0'))
+    {
+        return 1; /* 无关键字要求: OK即完整 */
+    }
+
+    strncpy(Tmp, pExpectKeys, sizeof(Tmp) - 1);
+
+    Tmp[sizeof(Tmp) - 1] = '\0';
+
+    Tok = strtok(Tmp, ",");
+
+    while (Tok != NULL)
+    {
+        const char *Hit = NULL;
+
+        /* 在[pResp, pEnd)内搜索Tok */
+        for (Hit = strstr(pResp, Tok); Hit != NULL; Hit = strstr(Hit + 1, Tok))
+        {
+            if (Hit < pEnd)
+            {
+                break;
+            }
+        }
+
+        if (Hit == NULL)
+        {
+            return 0;
+        }
+
+        Tok = strtok(NULL, ",");
+    }
+
+    return 1;
+}
+
+/**
+ * @brief 收应答直到超时: 先按帧结构剔除AA 55推送帧, 再过滤不可见字节,
+ *        "全部关键字+OK\r\n"双条件齐备才截断返回
+ *
+ * @param pExpectKeys 逗号分隔的期望关键字(NULL/空=仅OK即完整)
+ *
+ * @return 1=收到完整应答(关键字+OK, 截断到OK之后) 0=超时
+ *
+ * @note  真机数据流(50Hz二进制推送帧)与AT应答字节级交织: 推送帧内可见字节会
+ *        打断关键字文本(如AccScaleCf<帧字节>g:16), 噪声中假OK会提前截断缓冲,
+ *        故先整帧剔除推送帧(AA 55头+合法整帧长), 且要求OK之前已含全部关键字
+ */
+static int AtRecvResp(DrvSerial_S *pDrv, char *pResp, double TimeoutMs, const char *pExpectKeys)
+{
+    unsigned char Tmp[512];
+
+    unsigned char Raw[2048]; /* 原始滑窗: 剔帧后剩余字节进入文本过滤 */
+
+    int RawLen = 0;
+
+    int Len = 0; /* pResp当前长度 */
 
     double Start = NowMs();
-
-    int Len = 0;
 
     pResp[0] = '\0';
 
     while (G_Running && ((NowMs() - Start) < TimeoutMs))
     {
-        int n = DrvSerialRecv(pDrv, Buf, (int)sizeof(Buf));
+        int n = DrvSerialRecv(pDrv, Tmp, (int)sizeof(Tmp));
 
         int i;
 
@@ -253,33 +311,96 @@ static int AtRecvResp(DrvSerial_S *pDrv, char *pResp, double TimeoutMs)
             continue; /* VTIME=1半阻塞读: 无数据100ms返回, 循环可及时响应SIGINT */
         }
 
-        /* 只保留可见字符与回车换行, 丢弃数据流二进制字节(防止0x00截断后续匹配) */
+        /* 原始字节入滑窗(满则丢最旧) */
         for (i = 0; i < n; i++)
         {
-            unsigned char c = Buf[i];
-
-            if (((c >= 0x20) && (c < 0x7F)) || (c == 0x0D) || (c == 0x0A))
+            if (RawLen >= (int)sizeof(Raw))
             {
-                if (Len < (AT_RESP_MAX - 1))
+                memmove(Raw, &Raw[1], (size_t)(RawLen - 1));
+
+                RawLen--;
+            }
+
+            Raw[RawLen++] = Tmp[i];
+        }
+
+        /* 滑窗处理: 剔除AA 55整帧, 其余字节可见性过滤进pResp */
+        i = 0;
+
+        while (i < RawLen)
+        {
+            if ((Raw[i] == 0xAA) && (i + 1 < RawLen) && (Raw[i + 1] == 0x55))
+            {
+                if ((i + 6) > RawLen)
                 {
-                    pResp[Len++] = (char)c;
+                    break; /* 帧头字段未收全, 等后续字节 */
+                }
+
+                {
+                    int FrameLen = Raw[i + 4] | ((int)Raw[i + 5] << 8);
+
+                    if ((FrameLen >= 8) && (FrameLen <= 1024))
+                    {
+                        if ((i + FrameLen) > RawLen)
+                        {
+                            break; /* 帧未收全, 等后续字节 */
+                        }
+
+                        i += FrameLen; /* 整帧剔除(数据流推送帧) */
+
+                        continue;
+                    }
+                }
+
+                /* 长度非法: 不是帧, 当普通字节消费 */
+            }
+
+            {
+                unsigned char c = Raw[i];
+
+                if (((c >= 0x20) && (c < 0x7F)) || (c == 0x0D) || (c == 0x0A))
+                {
+                    if (Len < (AT_RESP_MAX - 1))
+                    {
+                        pResp[Len++] = (char)c;
+                    }
                 }
             }
+
+            i++;
+        }
+
+        if (i > 0)
+        {
+            memmove(Raw, &Raw[i], (size_t)(RawLen - i));
+
+            RawLen -= i;
         }
 
         pResp[Len] = '\0';
 
-        /* 全缓冲搜索OK: 应答OK后跟数据噪声/分块到达均不漏判 */
+        /* 截断判定: 逐个检查OK\r\n, 取第一个其前缀已含全部关键字的OK */
         {
             char *pOk = strstr(pResp, "OK\r\n");
 
-            if (pOk != NULL)
+            while (pOk != NULL)
             {
-                pOk[4] = '\0'; /* 截断到OK换行之后 */
+                if (KeysAllBefore(pResp, pExpectKeys, pOk) != 0)
+                {
+                    pOk[4] = '\0'; /* 截断到OK换行之后 */
 
-                return 1;
+                    return 1;
+                }
+
+                pOk = strstr(pOk + 1, "OK\r\n"); /* 假OK(噪声): 其前无关键字, 继续找 */
             }
         }
+    }
+
+    /* 超时: 缓冲中存在OK(即使关键字不齐)仍返回1, 由上层按关键字判定FAIL */
+    if (strstr(pResp, "OK\r\n") != NULL)
+    {
+        return 1;
     }
 
     pResp[Len] = '\0';
@@ -445,7 +566,7 @@ static void RunTimeSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
 
     /* 1. 查询原时间, 取不到则不动设备时间 */
     if ((AtSend(pDrv, "AT+DATATIME?") != 0) ||
-        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0) ||
+        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, "DataTime:") == 0) ||
         ((p = strstr(Resp, "DataTime:")) == NULL))
     {
         snprintf(pRes->Note, sizeof(pRes->Note), "查询原时间失败, 跳过以免改设备时间");
@@ -478,7 +599,7 @@ static void RunTimeSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
         return;
     }
 
-    if (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0)
+    if (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, NULL) == 0)
     {
         snprintf(pRes->Note, sizeof(pRes->Note), "设置测试时间未收到OK");
 
@@ -489,7 +610,7 @@ static void RunTimeSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
     snprintf(Restore, sizeof(Restore), "AT+DATATIME=%s", SetFmt);
 
     if ((AtSend(pDrv, Restore) != 0) ||
-        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0))
+        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, NULL) == 0))
     {
         snprintf(pRes->Note, sizeof(pRes->Note), "还原原时间失败(原:%s)", Orig);
 
@@ -526,7 +647,7 @@ static void RunScaleSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes
 
     /* 1. 查询原量程, 取不到则不动设备配置 */
     if ((AtSend(pDrv, pCase->QueryCmd) != 0) ||
-        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0) ||
+        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, pCase->GetKey) == 0) ||
         ((p = strstr(Resp, pCase->GetKey)) == NULL))
     {
         snprintf(pRes->Note, sizeof(pRes->Note), "查询原量程失败, 跳过以免无法还原");
@@ -569,7 +690,7 @@ static void RunScaleSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes
     /* 3. 设避让档验证 */
     snprintf(Cmd, sizeof(Cmd), pCase->Cmd, NewVal);
 
-    if ((AtSend(pDrv, Cmd) != 0) || (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0))
+    if ((AtSend(pDrv, Cmd) != 0) || (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, NULL) == 0))
     {
         snprintf(pRes->Note, sizeof(pRes->Note), "设%d未收到OK", NewVal);
 
@@ -579,7 +700,7 @@ static void RunScaleSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes
     /* 4. 还原原量程 */
     snprintf(Cmd, sizeof(Cmd), pCase->Cmd, Orig);
 
-    if ((AtSend(pDrv, Cmd) != 0) || (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0))
+    if ((AtSend(pDrv, Cmd) != 0) || (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, NULL) == 0))
     {
         snprintf(pRes->Note, sizeof(pRes->Note), "还原%d失败", Orig);
 
@@ -628,7 +749,7 @@ static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
     {
         static char Resp[AT_RESP_MAX];
 
-        if (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0)
+        if (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS, pCase->Expect) == 0)
         {
             snprintf(pRes->Note, sizeof(pRes->Note), "超时未收到OK");
 
@@ -709,7 +830,7 @@ int BspAtTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    printf("===== AT指令验证器 V1.5.0 (设备 %s @%d, %s) =====\n",
+    printf("===== AT指令验证器 V1.6.1 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
