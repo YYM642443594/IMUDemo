@@ -1,5 +1,3 @@
-uart_stat
-at_test
-hex_test
+imu_test
 can_stat
 *.o

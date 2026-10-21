@@ -1,14 +1,14 @@
-# `IMU Linux` 串口验证程序 (uart_stat + at_test + hex_test)
+# `IMU Linux` 串口验证程序 (imu_test: 数据流统计 + AT指令 + HEX协议)
 
 [TOC]
 
 ## 概述
 
-	本项目是基于志翔`IMU`的 Linux 串口**测试验证程序集**，参照 `feature/LinuxCanTestVerifDemo` 分支的统计方式与三层架构（驱动/队列/协议），包含三个工具：
+	本项目是基于志翔`IMU`的 Linux 串口**测试验证程序**（单可执行 `imu_test`，参数选择功能），参照 `feature/LinuxCanTestVerifDemo` 分支的统计方式与三层架构（驱动/队列/协议），包含三种验证功能：
 
-	- **uart_stat**：数据流验证 —— 接收志翔私有协议推送报文，实现数据包1/2/3/4 的帧级统计与解析，验证帧率是否达标、间隔是否均匀、有无断流、物理量解析正确性。
-	- **at_test**：AT指令验证 —— 依据《用户协议》第2章逐条下发 AT 指令并按文档应答格式判定，验证完成后自动还原配置。
-	- **hex_test**：HEX协议验证 —— 依据《用户协议》第3.2章串口交互协议，对全部报文 ID 逐一下发查询/写入帧并按应答格式判定（Len/CRC/值域），写 RAM 项验证后依据查询缓存自动还原。
+	- **功能1 数据流统计**：接收志翔私有协议推送报文，实现数据包1/2/3/4 的帧级统计与解析，验证帧率是否达标、间隔是否均匀、有无断流、物理量解析正确性。
+	- **功能2 AT指令验证**：依据《用户协议》第2章逐条下发 AT 指令并按文档应答格式判定，验证完成后自动还原配置。
+	- **功能3 HEX协议验证**：依据《用户协议》第3.2章串口交互协议，对全部报文 ID 逐一下发查询/写入帧并按应答格式判定（Len/CRC/值域），写 RAM 项验证后依据查询缓存自动还原。
 
 ## 功能特性
 
@@ -35,13 +35,13 @@
 
 ```
 00.Code/
-├── main.c                 # 主程序入口，线程管理，周期打印统计
+├── main.c                 # 统一入口：功能分发(1统计/2AT/3HEX) + 统计主循环、线程管理
 ├── drv_serial.c/h         # 串口驱动模块（termios，8N1，低延迟）
 ├── bsp_uart_queue.c/h     # 字节流SPSC环形队列模块（4KB）
 ├── bsp_uart_protocol.c/h  # 协议层：帧同步/CRC16/统计/数据包1~4解析
-├── bsp_at_test.c          # AT指令逐条验证器（查询/动作分组，配置自动还原）
-├── bsp_hex_test.c         # HEX交互协议逐报文验证器（3.2章全ID覆盖，RAM配置自动还原）
-├── run.sh                 # 一键编译运行脚本（菜单选择 uart_stat / at_test / hex_test）
+├── bsp_at_test.c/h        # AT指令逐条验证器（查询/动作分组，配置自动还原）
+├── bsp_hex_test.c/h       # HEX交互协议逐报文验证器（3.2章全ID覆盖，RAM配置自动还原）
+├── run.sh                 # 一键编译运行脚本（菜单选择 1统计 / 2AT / 3HEX，-h 帮助）
 └── Readme.md              # 项目说明文档
 ```
 
@@ -57,25 +57,26 @@ UartRecvThread(生产者)  --字节流-->  UartQueue  --字节流-->  UartParseT
 ## 构建与运行
 
 ```bash
-# 一键编译并弹出功能菜单（1=数据流统计 uart_stat / 2=AT指令验证 at_test / 3=HEX协议验证 hex_test）（默认 /dev/ttyUSB0 @921600）
+# 一键编译并弹出功能菜单（1=数据流统计 / 2=AT指令验证 / 3=HEX协议验证）（默认 /dev/ttyUSB0 @921600；./run.sh -h 详细帮助）
 ./run.sh
 
 # 指定串口/波特率/限时10秒
 ./run.sh /dev/ttyUSB0 921600 10
 
-# 手动编译
-gcc -O2 -Wall -o uart_stat main.c drv_serial.c bsp_uart_queue.c bsp_uart_protocol.c -lpthread
-gcc -O2 -Wall -o at_test bsp_at_test.c drv_serial.c -lpthread
-gcc -O2 -Wall -o hex_test bsp_hex_test.c drv_serial.c -lpthread
+# 手动编译(单程序)
+gcc -O2 -Wall -o imu_test main.c drv_serial.c bsp_uart_queue.c bsp_uart_protocol.c \
+    bsp_at_test.c bsp_hex_test.c -lpthread
 ```
 
-用法：`./uart_stat [串口设备] [波特率] [持续秒数]`，持续秒数 0 或缺省=直到 Ctrl-C。
+统一用法：`./imu_test [串口设备] [波特率] [功能] [功能参数]`
 
-用法：`./at_test [串口设备] [波特率] [模式]`，模式 0=仅安全组（默认），1=安全组+风险组（改配置项验证后自动还原）。
+| 功能 | 参数 | 功能参数 | 示例 |
+|---|---|---|---|
+| 1=数据流统计（默认） | 第3参数非 2/3 时视为持续秒数，0=直到 Ctrl-C | 秒数 | `./imu_test /dev/ttyUSB0 921600 10` |
+| 2=AT指令验证 | `2` | 模式：0=仅安全组（默认），1=安全组+风险组（验证后自动还原） | `./imu_test /dev/ttyUSB0 921600 2 1` |
+| 3=HEX协议验证 | `3` | 模式含义同功能2 | `./imu_test /dev/ttyUSB0 921600 3 0` |
 
-用法：`./hex_test [串口设备] [波特率] [模式]`，模式含义同 at_test。
-
-## AT指令验证说明 (at_test)
+## AT指令验证说明 (功能2)
 
 依据《用户协议》第2章 AT 指令表逐条验证，判定规则：
 
@@ -87,7 +88,7 @@ gcc -O2 -Wall -o hex_test bsp_hex_test.c drv_serial.c -lpthread
 
 超时 800ms 无 `OK` 判 FAIL；数据流推送报文与 AT 应答共存于同一串口，工具按"完整 `OK\r\n` 结尾"提取应答，原始应答片段原样打印便于人工复核。
 
-## HEX协议验证说明 (hex_test)
+## HEX协议验证说明 (功能3)
 
 依据《用户协议》第3.2章串口交互协议验证，覆盖 3.2.2 报文 ID 表全部 16 个 ID 及 3.2.3 详述的 0x0020 零偏校准、0x0021 YAW 归零（共 18 个）。帧格式 `AA 55 | CMD(ID高字节) | ID | Op | Len(2,小端,整帧长) | DATA | CRC16(2,小端)`，应答帧无 Op 字段；CRC16 初值 `0x3692`、多项式 `0x8408`（反向），范围=帧头至数据域末，与 uart_stat 的 BspUartCrc16 同算法。
 
@@ -148,3 +149,4 @@ gcc -O2 -Wall -o hex_test bsp_hex_test.c drv_serial.c -lpthread
 10. 版本：V1.4.0（2026-10-20）—— at_test 补齐《用户协议》第2章指令覆盖：新增 `AT+CANBAUD?` 查询（安全组14条）、`AT+DATALINK=UART,0`/`AT+MSGID=13,0`/`AT+PPSMODE=1`/`AT+ZEROBIASCAL=ON` 风险组用例（成对自动还原）；`AT+DATATIME=` 设置类先查原时间、验证后自动还原；`AT+RST` 复位重启置用例表末执行；至此除 `BAUD=`/`COORDINATE=`/`PUSHFRQ=`/`CANBAUD=` 四条有意排除项外全量覆盖
 11. 版本：V1.5.0（2026-10-20）—— 新增 HEX 交互协议逐报文验证器 hex_test（bsp_hex_test.c）：依据《用户协议》第3.2章覆盖全部 18 个报文 ID（3.2.2 表 16 个 + 0x0020/0x0021），安全组 11 查询+YAW 归零、风险组写 RAM 动态成对还原（查询缓存避让原值构造设置帧与还原帧）、时间同步主机时间、复位置表末；有意排除掉电保存与断链类（蓝牙名称/波特率写入/FLASH 档）；run.sh 菜单升级为 1=uart_stat / 2=at_test / 3=hex_test
 12. 版本：V1.5.1（2026-10-20）—— hex_test 输出对齐：名称列改按 UTF-8 显示宽度补空格（中文按 2 列计），逐条行与汇总表的 PASS/FAIL/结果列逐行对齐（`%-20s` 按字节补齐在中文下会错位）
+13. 版本：V1.6.0（2026-10-20）—— 单程序整合：AT/HEX 验证并入统一入口 `imu_test`（main.c 分发功能 1/2/3，`BspAtTestRun`/`BspHexTestRun` 供调用，新增对应头文件），不再单独编译 at_test/hex_test；第3参数 2/3=功能选择、其余=持续秒数（兼容旧 uart_stat 用法）；run.sh 单目标编译+菜单/帮助同步；pty 冒烟：功能1 统计正常（98帧 CRC 全过）、功能2 AT 35/35 PASS、功能3 HEX 22/22 PASS

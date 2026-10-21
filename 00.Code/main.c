@@ -2,31 +2,39 @@
  *******************************************************************************
  * @file    main.c
  * @author  杨镒铭
- * @version V1.2.1
- * @date    2026-10-15
- * @brief   Linux串口IMU数据统计工具(UART版)
+ * @version V1.6.0
+ * @date    2026-10-20
+ * @brief   Linux串口IMU验证工具统一入口(UART版: 数据流统计/AT指令/HEX协议)
  *
  * @detail
  *   参照 feature/LinuxCanTestVerifDemo 分支的统计方式, 通过串口
- *   (志翔私有协议, 默认921600 8N1)接收IMU推送报文并做帧级统计与解析:
- *   - 数据包1(0x0001)/数据包2(0x0010)/数据包3(0x0013)/数据包4(0x0022)
+ *   (志翔私有协议, 默认921600 8N1)提供三种验证功能(单程序, 参数选择):
+ *   - 功能1(默认): 数据流统计, 接收IMU推送报文做帧级统计与解析
+ *     数据包1(0x0001)/数据包2(0x0010)/数据包3(0x0013)/数据包4(0x0022)
  *     各自独立统计: 帧数 / 平均Hz / 瞬时Hz / 帧间隔(当前/平均/最小/最大ms)
- *   - CRC16校验(初值0x3692, 多项式0x8408反向), 只统计校验通过的帧
- *   - 各包最新帧按协议(小端)解析展示
- *   终端下每秒原地刷新。
+ *   - 功能2: AT指令逐条验证(bsp_at_test, 依据协议文档第2章)
+ *   - 功能3: HEX交互协议逐报文验证(bsp_hex_test, 依据协议文档3.2章)
+ *   CRC16校验(初值0x3692, 多项式0x8408反向), 只统计校验通过的帧.
+ *   终端下功能1每秒原地刷新.
  *
  * @arch
- *   main(统计显示) ── bsp_uart_protocol(帧同步/CRC/统计/解析)
- *        │                    │
+ *   main(入口分发+统计显示) ── bsp_uart_protocol(帧同步/CRC/统计/解析)
+ *        │       │                  │
+ *        │       └─ bsp_at_test / bsp_hex_test(指令与协议验证)
+ *        │                          │
  *   bsp_uart_queue(字节流SPSC环形队列)
- *        │                    │
+ *        │                          │
  *   drv_serial(termios串口驱动)
  *
- * @usage  ./uart_stat </dev/ttyUSB0> [波特率] [持续秒数, 0=直到Ctrl-C]
+ * @usage  ./imu_test [串口设备] [波特率] [功能] [功能参数]
+ *           功能: 1=数据流统计(默认, 功能参数=持续秒数)
+ *                 2=AT指令验证(功能参数=模式0/1)
+ *                 3=HEX协议验证(功能参数=模式0/1)
  *
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.0<td>2026-10-20<td>杨镒铭<td>单程序整合: AT/HEX验证并入统一入口(功能2/3), 不再单独编译at_test/hex_test; 兼容旧用法(第3参数非2/3时按持续秒数处理)
  * <tr><td>V1.0.0<td>2026-10-15<td>杨镒铭<td>创建
  *   <tr><td>V1.1.0<td>2026-10-15<td>杨镒铭<td>新增数据包2/3/4设备时间戳差值Δt统计与诊断计数
  *   <tr><td>V1.1.1<td>2026-10-15<td>杨镒铭<td>确认解析随每帧更新(显示冻结为旧进程占用串口所致), 版本号补齐
@@ -49,13 +57,15 @@
 #include "drv_serial.h"
 #include "bsp_uart_queue.h"
 #include "bsp_uart_protocol.h"
+#include "bsp_at_test.h"
+#include "bsp_hex_test.h"
 
 /*===========================================================
 =                       全局对象
 ===========================================================*/
 
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.2.1";
+static const char *G_Version = "V1.6.0";
 
 /** @brief 串口驱动控制块 */
 static DrvSerial_S G_Serial = { .Fd = -1, .Dev = "/dev/ttyUSB0", .Baud = 921600 };
@@ -200,15 +210,25 @@ UartParseThread(void *arg)
  */
 static void PrintUsage(const char *Prog)
 {
-    printf("用法: %s [串口设备] [波特率] [持续秒数]\r\n", Prog);
+    printf("用法: %s [串口设备] [波特率] [功能] [功能参数]\r\n", Prog);
 
     printf("  串口设备  默认 /dev/ttyUSB0\r\n");
 
     printf("  波特率    默认 921600 (协议默认, 8N1)\r\n");
 
-    printf("  持续秒数  默认 0 = 直到Ctrl-C\r\n");
+    printf("  功能      1=数据流统计(默认) 2=AT指令验证 3=HEX协议验证\r\n");
 
-    printf("示例: %s /dev/ttyUSB1 921600 10\r\n", Prog);
+    printf("            第3参数非2/3时视为持续秒数(兼容旧用法)\r\n");
+
+    printf("  功能参数  功能1: 持续秒数, 默认0=直到Ctrl-C\r\n");
+
+    printf("            功能2/3: 模式, 0=仅安全组(默认) 1=安全组+风险组(自动还原)\r\n");
+
+    printf("示例: %s /dev/ttyUSB1 921600 10      (数据流统计跑10秒)\r\n", Prog);
+
+    printf("      %s /dev/ttyUSB1 921600 2 1    (AT验证含风险组)\r\n", Prog);
+
+    printf("      %s /dev/ttyUSB1 921600 3      (HEX验证仅安全组)\r\n", Prog);
 }
 
 int main(int argc, char *argv[])
@@ -245,6 +265,19 @@ int main(int argc, char *argv[])
 
             return -1;
         }
+    }
+
+    /* ---------- 功能分发: 第3参数2/3=AT/HEX验证, 其余=持续秒数(兼容旧用法) ---------- */
+    if ((argc > 3) && (strcmp(argv[3], "2") == 0))
+    {
+        return BspAtTestRun(G_Serial.Dev, G_Serial.Baud,
+                            (argc > 4) ? atoi(argv[4]) : 0);
+    }
+
+    if ((argc > 3) && (strcmp(argv[3], "3") == 0))
+    {
+        return BspHexTestRun(G_Serial.Dev, G_Serial.Baud,
+                             (argc > 4) ? atoi(argv[4]) : 0);
     }
 
     if (argc > 3)

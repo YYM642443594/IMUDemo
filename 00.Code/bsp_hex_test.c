@@ -2,9 +2,9 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.5.1
+ * @version V1.5.2
  * @date    2026-10-20
- * @brief   志翔IMU HEX交互协议逐报文验证器
+ * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
  * @detail
  *   依据 01.Doc/用户协议.md 第3.2章 串口交互协议, 对每个报文ID做实测验证:
@@ -26,6 +26,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.5.2<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspHexTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
  * <tr><td>V1.5.1<td>2026-10-20<td>杨镒铭<td>输出对齐: 名称列改按UTF-8显示宽度补空格(中文按2列), 逐条行与汇总表PASS/FAIL列对齐
  * <tr><td>V1.5.0<td>2026-10-20<td>杨镒铭<td>创建: 18个报文ID全覆盖, 安全组11查询+YAW归零,
  *     风险组RAM写入成对动态还原(频率/算法模式/推送状态/报文ID/PPS/坐标系/磁力计/零偏),
@@ -1127,7 +1128,7 @@ static const char *StatStr(const HxResult_S *pRes)
     return (pRes->Pass != 0) ? "PASS" : "FAIL";
 }
 
-int main(int argc, char *argv[])
+int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 {
     DrvSerial_S Serial = { .Fd = -1, .Dev = "/dev/ttyUSB0", .Baud = 921600 };
 
@@ -1139,18 +1140,23 @@ int main(int argc, char *argv[])
 
     int SkipNum = 0;
 
-    /* 用法: hex_test [串口] [波特率] [模式0/1] */
-    if (argc > 1) { strncpy(Serial.Dev, argv[1], sizeof(Serial.Dev) - 1); }
+    if (pDev != NULL)
+    {
+        strncpy(Serial.Dev, pDev, sizeof(Serial.Dev) - 1);
 
-    if (argc > 2) { Serial.Baud = atoi(argv[2]); }
+        Serial.Dev[sizeof(Serial.Dev) - 1] = '\0';
+    }
 
-    int RunRisk = (argc > 3) ? atoi(argv[3]) : 0; /* 参数3=是否跑风险组 */
+    if (Baud > 0)
+    {
+        Serial.Baud = Baud;
+    }
 
     InstallSignal(SIGINT);
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.5.1 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.5.2 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)

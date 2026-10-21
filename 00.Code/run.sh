@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================
 # IMU Linux 验证工具 一键构建运行脚本
-# 用法: ./run.sh [串口设备] [波特率] [持续秒数(at_test/hex_test忽略)]
+# 用法: ./run.sh [串口设备] [波特率] [持续秒数(功能1用, 功能2/3自动跑完)]
 #        ./run.sh -h          查看详细帮助
 #   默认: /dev/ttyUSB0 921600 0(直到Ctrl-C)
-# 功能: 弹出菜单选择 1=uart_stat数据流统计 2=at_test AT指令验证 3=hex_test HEX协议验证
+# 功能: 弹出菜单选择 1=数据流统计 2=AT指令验证 3=HEX协议验证(单程序imu_test)
 # ============================================================
 
 # ---- 0. 帮助 ----
@@ -23,15 +23,15 @@ ShowHelp()
   2) 波特率      默认 921600, 可选
                 9600/19200/38400/57600/115200/230400/460800/921600
   3) 持续秒数    默认 0 = 一直运行直到 Ctrl-C
-                仅菜单1(uart_stat)使用; 菜单2/3自动跑完, 此参数忽略
+                仅菜单1(数据流统计)使用; 菜单2/3自动跑完, 此参数忽略
 
-菜单功能(运行后交互选择):
-  1) uart_stat  数据流统计验证: 帧率/帧间隔/CRC校验/数据包1~4解析
-                对应工具用法: ./uart_stat [串口] [波特率] [持续秒数]
-  2) at_test    AT指令验证: 逐条下发AT指令, 验证后自动还原配置
-                对应工具用法: ./at_test  [串口] [波特率] [模式]
-  3) hex_test   HEX协议验证: 3.2章报文逐ID下发验证+RAM配置自动还原
-                对应工具用法: ./hex_test [串口] [波特率] [模式]
+菜单功能(运行后交互选择, 亦可直接带功能参数运行 imu_test):
+  1) 数据流统计   帧率/帧间隔/CRC校验/数据包1~4解析
+                直接运行: ./imu_test [串口] [波特率] [秒数]
+  2) AT指令验证   逐条下发AT指令, 验证后自动还原配置
+                直接运行: ./imu_test [串口] [波特率] 2 [模式]
+  3) HEX协议验证  3.2章报文逐ID下发验证+RAM配置自动还原
+                直接运行: ./imu_test [串口] [波特率] 3 [模式]
 
 模式说明(菜单2/3, 交互时输入):
   0 = 仅安全组: 只读查询+无副作用动作, 随时可跑(默认, 直接回车)
@@ -48,6 +48,8 @@ ShowHelp()
   ./run.sh                          # 菜单选择, 默认 /dev/ttyUSB0 @921600
   ./run.sh /dev/ttyUSB1 115200      # 菜单选择, 指定串口与波特率
   ./run.sh /dev/ttyUSB0 921600 10   # 菜单选1时跑10秒自动停
+  ./imu_test /dev/ttyUSB0 921600 2  # 跳过菜单直接AT验证(安全组)
+  ./imu_test /dev/ttyUSB0 921600 3 1# 跳过菜单直接HEX验证(含风险组)
 EOF
 }
 
@@ -63,19 +65,14 @@ BAUD="${2:-921600}"
 SECS="${3:-0}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ---- 1. 构建(双工具) ----
+# ---- 1. 构建(单程序, 三功能合一) ----
 echo "== Build =="
-gcc -O2 -Wall -o "$DIR/uart_stat" \
+gcc -O2 -Wall -o "$DIR/imu_test" \
     "$DIR/main.c" "$DIR/drv_serial.c" \
     "$DIR/bsp_uart_queue.c" "$DIR/bsp_uart_protocol.c" \
-    -lpthread || { echo "Build uart_stat Fail"; exit 1; }
-gcc -O2 -Wall -o "$DIR/at_test" \
-    "$DIR/bsp_at_test.c" "$DIR/drv_serial.c" \
-    -lpthread || { echo "Build at_test Fail"; exit 1; }
-gcc -O2 -Wall -o "$DIR/hex_test" \
-    "$DIR/bsp_hex_test.c" "$DIR/drv_serial.c" \
-    -lpthread || { echo "Build hex_test Fail"; exit 1; }
-echo "Build OK (uart_stat + at_test + hex_test)"
+    "$DIR/bsp_at_test.c" "$DIR/bsp_hex_test.c" \
+    -lpthread || { echo "Build imu_test Fail"; exit 1; }
+echo "Build OK (imu_test: 1=数据流统计 2=AT指令验证 3=HEX协议验证)"
 
 # ---- 2. 串口存在性检查 ----
 if [ ! -e "$DEV" ]; then
@@ -112,8 +109,8 @@ case "$CHOICE" in
         printf "模式 [0/1, 回车=0]: "
         read -r MODE
         MODE="${MODE:-0}"
-        echo "== Run: at_test $DEV $BAUD $MODE =="
-        exec "$DIR/at_test" "$DEV" "$BAUD" "$MODE"
+        echo "== Run: imu_test 功能2(AT) $DEV $BAUD 模式$MODE =="
+        exec "$DIR/imu_test" "$DEV" "$BAUD" 2 "$MODE"
         ;;
     3)
         echo ""
@@ -121,11 +118,11 @@ case "$CHOICE" in
         printf "模式 [0/1, 回车=0]: "
         read -r MODE
         MODE="${MODE:-0}"
-        echo "== Run: hex_test $DEV $BAUD $MODE =="
-        exec "$DIR/hex_test" "$DEV" "$BAUD" "$MODE"
+        echo "== Run: imu_test 功能3(HEX) $DEV $BAUD 模式$MODE =="
+        exec "$DIR/imu_test" "$DEV" "$BAUD" 3 "$MODE"
         ;;
     *)
-        echo "== Run: uart_stat $DEV $BAUD $SECS =="
-        exec "$DIR/uart_stat" "$DEV" "$BAUD" "$SECS"
+        echo "== Run: imu_test 功能1(数据流统计) $DEV $BAUD ${SECS}s =="
+        exec "$DIR/imu_test" "$DEV" "$BAUD" "$SECS"
         ;;
 esac

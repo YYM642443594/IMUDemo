@@ -2,9 +2,9 @@
  *******************************************************************************
  * @file    bsp_at_test.c
  * @author  杨镒铭
- * @version V1.4.0
+ * @version V1.5.0
  * @date    2026-10-20
- * @brief   志翔IMU AT指令逐条验证器
+ * @brief   志翔IMU AT指令逐条验证器(由main.c统一入口调用, 单程序整合版)
  *
  * @detail
  *   依据 01.Doc/用户协议.md 第2章 AT指令表, 对每条AT指令做实测验证:
@@ -21,6 +21,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.5.0<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspAtTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
  * <tr><td>V1.4.0<td>2026-10-20<td>杨镒铭<td>补齐文档指令覆盖: 新增CANBAUD?查询与DATALINK/MSGID=13/PPSMODE/ZEROBIASCAL风险组(成对自动还原); DATATIME=设置先查原时间验证后自动还原; RST复位重启置表末
  * <tr><td>V1.3.1<td>2026-10-15<td>杨镒铭<td>输出整理: 每条一行+末尾汇总表; 修数据流混流假FAIL(全缓冲搜OK+过滤二进制); 修banner字面转义
  * <tr><td>V1.3.0<td>2026-10-15<td>杨镒铭<td>创建: 安全组13查询+SET/YAWRESET, 风险组成对验证自动还原
@@ -569,7 +570,7 @@ static const char *StatStr(const AtResult_S *pRes)
     return (pRes->Pass != 0) ? "PASS" : "FAIL";
 }
 
-int main(int argc, char *argv[])
+int BspAtTestRun(const char *pDev, int Baud, int RunRisk)
 {
     DrvSerial_S Serial = { .Fd = -1, .Dev = "/dev/ttyUSB0", .Baud = 921600 };
 
@@ -581,18 +582,23 @@ int main(int argc, char *argv[])
 
     int SkipNum = 0;
 
-    /* 用法: at_test [串口] [波特率] [模式0/1] */
-    if (argc > 1) { strncpy(Serial.Dev, argv[1], sizeof(Serial.Dev) - 1); }
+    if (pDev != NULL)
+    {
+        strncpy(Serial.Dev, pDev, sizeof(Serial.Dev) - 1);
 
-    if (argc > 2) { Serial.Baud = atoi(argv[2]); }
+        Serial.Dev[sizeof(Serial.Dev) - 1] = '\0';
+    }
 
-    int RunRisk = (argc > 3) ? atoi(argv[3]) : 0; /* 参数3=是否跑风险组 */
+    if (Baud > 0)
+    {
+        Serial.Baud = Baud;
+    }
 
     InstallSignal(SIGINT);
 
     InstallSignal(SIGTERM);
 
-    printf("===== AT指令验证器 V1.4.0 (设备 %s @%d, %s) =====\n",
+    printf("===== AT指令验证器 V1.5.0 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
