@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.3
+ * @version V1.6.4
  * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -26,6 +26,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.4<td>2026-10-21<td>杨镒铭<td>固件量程应答已对齐文档(PayLoad 16改10): ExpectLen 24改回18直接命中, 宽容阶段保留兼容旧固件24字节行为
  * <tr><td>V1.6.3<td>2026-10-21<td>杨镒铭<td>0x22量程查询定因修复: 查阅固件工程(bsp_parse.c L1752)确认应答PayLoad=16字节/整帧24字节, 与文档回复表(18字节)不符 -> ExpectLen按固件实际改24, 之前18过滤吞掉应答致假超时; 固件查询分支只认DATA[0]类型不校验长度, 3格式探测均可达; 宽容阶段保留兼容文档式18
  * <tr><td>V1.6.2<td>2026-10-21<td>杨镒铭<td>0x22量程查询再加诊断: 3格式探测后增加不限应答长度的宽容收包(跳过数据包4推送帧), 应答值在档位表即通过并标注[宽容:应答Len=n]; 解析失败打印原始帧hex; 全无应答明确提示固件串口0x22查询可能未实现
  * <tr><td>V1.6.1<td>2026-10-21<td>杨镒铭<td>修真机0x0022量程查询超时: 文档3.2.3.17仅给设置表, 此前按设置帧同构构造查询帧无应答 -> 改为多格式自动探测(类型+预留8(CAN 0x115查询映射)/类型1/设置帧同构), 命中格式在结果标注; 0x0004查询补DATA字节(文档3.2.3.2: 查询时填0)
@@ -175,13 +176,13 @@ static HxCase_S G_Cases[] =
     { 0x01, 0x01, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0101A值查询",      "aval",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
     { 0x01, 0x03, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0103电池电量查询", "batt",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
 
-    /* 文档新增3.2.3.17: 量程查询(文档仅给设置表; 固件实测: 查询帧任意DATA长度带类型字节即可,
-       应答PayLoad=16字节/整帧24字节(固件bsp_parse.c L1752), 与文档回复表(18字节)不一致)
-       ExpectLen按固件实际24, 宽容阶段兜底兼容文档式18; 跳过数据包4推送帧(46)防混叠 */
+    /* 文档新增3.2.3.17: 量程查询(固件查询分支只认DATA[0]类型字节, 不校验DATA长度)
+       应答帧长: 固件已对齐文档回复表(PayLoad=10/整帧18, 2026-10-21修改);
+       旧固件曾为PayLoad=16/整帧24, 宽容阶段兜底兼容; 跳过数据包4推送帧(46)防混叠 */
     { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022加速度量程查询", "accscale",
-      HX_S_SCALE_Q, {0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 24 },
+      HX_S_SCALE_Q, {0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
     { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022角速度量程查询", "gyroscale",
-      HX_S_SCALE_Q, {0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 24 },
+      HX_S_SCALE_Q, {0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
 
     /* ---------- 安全组: 无持久副作用的动作(写RAM, 掉电不保存) ---------- */
     { 0x00, 0x21, HEX_OP_RAM, HX_T_ACTION, HX_G_SAFE, "0x0021YAW角归零", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
@@ -1366,7 +1367,7 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.6.3 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.6.4 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
