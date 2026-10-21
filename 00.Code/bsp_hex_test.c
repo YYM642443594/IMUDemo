@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.6
+ * @version V1.6.7
  * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -32,6 +32,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.7<td>2026-10-21<td>杨镒铭<td>消构建告警: MarkVals拼接改足量中间缓冲+限长memcpy拷回(替代二次snprintf), 免-Wformat-truncation, 截断保头行为不变
  * <tr><td>V1.6.6<td>2026-10-21<td>杨镒铭<td>函数长度规范重构(单函数≤30行): CheckQuery按校验键拆12个小函数+分发表, BuildSetData/RunRestore按类型拆构造函数, RunScaleQuery拆探测/诊断两阶段, 主流程拆单条执行/汇总/失败清单, TryExtractFrame/HexRecvFrame/RunCase等同步拆分, 行为不变
  * <tr><td>V1.6.5<td>2026-10-21<td>杨镒铭<td>参照固件bsp_parse.c封装方式重构可读性: 新增19个报文ID常量(HEX_ID_xxx, 对应固件RECV_ID_xxx_E)与帧字段命名访问宏(HEX_FR_CMD/ID/LEN, HEX_RESP_DATA/DATALEN/DATA0, HEX_REQ_DATA), 用例表与解析代码全部替换魔法数字/下标, 行为不变
  * <tr><td>V1.6.4<td>2026-10-21<td>杨镒铭<td>固件量程应答已对齐文档(PayLoad 16改10): ExpectLen 24改回18直接命中, 宽容阶段保留兼容旧固件24字节行为
@@ -1475,9 +1476,11 @@ static void MarkVals(HxResult_S *pRes, const char *pFmt, ...)
 {
     char Mark[HEX_VALS_MAX];
 
-    char Tmp[HEX_VALS_MAX];
+    char Tmp[(HEX_VALS_MAX * 2) + 2]; /* 两个95字节源+空格+NUL, 拼接必不截断 */
 
     va_list Args;
+
+    int n;
 
     va_start(Args, pFmt);
 
@@ -1485,9 +1488,16 @@ static void MarkVals(HxResult_S *pRes, const char *pFmt, ...)
 
     va_end(Args);
 
-    snprintf(Tmp, sizeof(Tmp), "%s %s", Mark, pRes->Vals);
+    n = snprintf(Tmp, sizeof(Tmp), "%s %s", Mark, pRes->Vals);
 
-    snprintf(pRes->Vals, (int)sizeof(pRes->Vals), "%s", Tmp);
+    /* 限长拷回Vals(超长保头截尾), 不用二次snprintf避免-Wformat-truncation */
+    if (n >= (int)sizeof(Tmp)) { n = (int)sizeof(Tmp) - 1; }
+
+    if (n >= (int)sizeof(pRes->Vals)) { n = (int)sizeof(pRes->Vals) - 1; }
+
+    memcpy(pRes->Vals, Tmp, (size_t)n);
+
+    pRes->Vals[n] = '\0';
 
     pRes->Pass = 1;
 }
