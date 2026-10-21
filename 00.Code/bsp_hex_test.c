@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.1
+ * @version V1.6.2
  * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -26,6 +26,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.2<td>2026-10-21<td>杨镒铭<td>0x22量程查询再加诊断: 3格式探测后增加不限应答长度的宽容收包(跳过数据包4推送帧), 应答值在档位表即通过并标注[宽容:应答Len=n]; 解析失败打印原始帧hex; 全无应答明确提示固件串口0x22查询可能未实现
  * <tr><td>V1.6.1<td>2026-10-21<td>杨镒铭<td>修真机0x0022量程查询超时: 文档3.2.3.17仅给设置表, 此前按设置帧同构构造查询帧无应答 -> 改为多格式自动探测(类型+预留8(CAN 0x115查询映射)/类型1/设置帧同构), 命中格式在结果标注; 0x0004查询补DATA字节(文档3.2.3.2: 查询时填0)
  * <tr><td>V1.6.0<td>2026-10-21<td>杨镒铭<td>补文档新增量程配置: 0x0022加/角速度量程查询(安全组, 应答帧长过滤防与数据包4推送混叠); 0x0022设置档为FLASH-only有意排除
  * <tr><td>V1.5.2<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspHexTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
@@ -477,10 +478,13 @@ static int TryExtractFrame(unsigned char Cmd, unsigned char Id, int ExpectLen,
 /**
  * @brief 收应答帧: 半阻塞循环读+滑窗匹配, 超时返回0
  *
+ * @param ExpectLen 期望应答帧长(0=不限)
+ * @param SkipLen   要跳过的同ID帧长(0=不跳; 如0x22量程查询跳过数据包4推送帧46)
+ *
  * @return >0=整帧长度 0=超时未收到匹配帧
  */
 static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
-                        int ExpectLen, unsigned char *pFrame, double TimeoutMs)
+                        int ExpectLen, int SkipLen, unsigned char *pFrame, double TimeoutMs)
 {
     unsigned char Buf[256];
 
@@ -517,6 +521,11 @@ static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
 
         if (Got > 0)
         {
+            if ((SkipLen > 0) && (Got == SkipLen))
+            {
+                continue; /* 同ID推送帧(如数据包4): 已消费丢弃, 继续等应答 */
+            }
+
             return Got;
         }
     }
@@ -528,12 +537,13 @@ static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
  * @brief 事务: 清缓冲->构造帧->发送->收应答
  *
  * @param ExpectLen 期望应答帧长(0=不限)
+ * @param SkipLen   要跳过的同ID帧长(0=不跳)
  *
  * @return >0=应答帧长 -1=发送失败 0=超时
  */
 static int HexTransact(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id, unsigned char Op,
                        const unsigned char *pData, unsigned char DataLen,
-                       int ExpectLen, unsigned char *pFrame)
+                       int ExpectLen, int SkipLen, unsigned char *pFrame)
 {
     unsigned char Req[HEX_FRAME_MAX];
 
@@ -550,7 +560,7 @@ static int HexTransact(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id, u
         return -1;
     }
 
-    return HexRecvFrame(pDrv, Cmd, Id, ExpectLen, pFrame, HEX_RESP_TIMEOUT_MS);
+    return HexRecvFrame(pDrv, Cmd, Id, ExpectLen, SkipLen, pFrame, HEX_RESP_TIMEOUT_MS);
 }
 
 /**
@@ -1112,7 +1122,7 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
             return 1;
     }
 
-    n = HexTransact(pDrv, pC->Cmd, pC->Id, HEX_OP_RAM, Data, DataLen, 0, Frame);
+    n = HexTransact(pDrv, pC->Cmd, pC->Id, HEX_OP_RAM, Data, DataLen, 0, 0, Frame);
 
     if (n <= 0)
     {
@@ -1152,6 +1162,7 @@ static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRe
 
     int n;
 
+    /* 阶段1: 按候选格式探测(期望应答帧长18=文档回复表) */
     for (f = 0; f < (sizeof(Fmt) / sizeof(Fmt[0])); f++)
     {
         memset(Data, 0, sizeof(Data));
@@ -1159,7 +1170,7 @@ static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRe
         Data[0] = pC->Data[0]; /* 量程类型: 0x01加速度 / 0x02角速度 */
 
         n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, Fmt[f].DataLen,
-                        pC->ExpectLen, Frame);
+                        pC->ExpectLen, 46, Frame);
 
         if (n > 0)
         {
@@ -1180,8 +1191,51 @@ static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRe
         }
     }
 
+    /* 阶段2诊断: 不限应答长度重试(跳过数据包4推送帧), 应答长度可能非文档18 */
+    memset(Data, 0, sizeof(Data));
+
+    Data[0] = pC->Data[0];
+
+    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, Fmt[0].DataLen,
+                    0, 46, Frame);
+
+    if (n > 0)
+    {
+        /* 宽容判定: 数据域>=2字节且量程值在档位表即通过 */
+        if (CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
+                       pRes->Note, (int)sizeof(pRes->Note)) != 0)
+        {
+            char Tmp[HEX_VALS_MAX];
+
+            snprintf(Tmp, sizeof(Tmp), "[宽容:应答Len=%d 格式:%s] %s",
+                     n, Fmt[0].Desc, pRes->Vals);
+
+            snprintf(pRes->Vals, (int)sizeof(pRes->Vals), "%s", Tmp);
+
+            pRes->Pass = 1;
+        }
+        else
+        {
+            /* 收到帧但解析不出档位: 打印原始帧辅助定位 */
+            char Hex[64];
+
+            int i;
+
+            int M = (n > 16) ? 16 : n;
+
+            for (i = 0; i < M; i++)
+            {
+                snprintf(&Hex[i * 3], 4, "%02X ", Frame[i]);
+            }
+
+            snprintf(pRes->Note, sizeof(pRes->Note), "应答Len=%d解析失败,帧:%.48s", n, Hex);
+        }
+
+        return;
+    }
+
     snprintf(pRes->Note, sizeof(pRes->Note),
-             "3种查询帧格式(类型+预留8/类型1/设置帧同构)均无应答");
+             "3格式+不限长诊断均无应答(固件串口0x22查询疑未实现)");
 }
 
 /**
@@ -1219,7 +1273,7 @@ static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
         return;
     }
 
-    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, DataLen, pC->ExpectLen, Frame);
+    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, DataLen, pC->ExpectLen, 0, Frame);
 
     if (n == -1)
     {
@@ -1311,7 +1365,7 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.6.1 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.6.2 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
