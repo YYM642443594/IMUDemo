@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.0
+ * @version V1.6.1
  * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -26,6 +26,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.1<td>2026-10-21<td>杨镒铭<td>修真机0x0022量程查询超时: 文档3.2.3.17仅给设置表, 此前按设置帧同构构造查询帧无应答 -> 改为多格式自动探测(类型+预留8(CAN 0x115查询映射)/类型1/设置帧同构), 命中格式在结果标注; 0x0004查询补DATA字节(文档3.2.3.2: 查询时填0)
  * <tr><td>V1.6.0<td>2026-10-21<td>杨镒铭<td>补文档新增量程配置: 0x0022加/角速度量程查询(安全组, 应答帧长过滤防与数据包4推送混叠); 0x0022设置档为FLASH-only有意排除
  * <tr><td>V1.5.2<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspHexTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
  * <tr><td>V1.5.1<td>2026-10-20<td>杨镒铭<td>输出对齐: 名称列改按UTF-8显示宽度补空格(中文按2列), 逐条行与汇总表PASS/FAIL列对齐
@@ -79,6 +80,7 @@ typedef enum
 typedef enum
 {
     HX_S_FIXED = 0,   /* 用表内固定Data */
+    HX_S_SCALE_Q,     /* 量程查询: 文档3.2.3.17未给查询帧格式, 按候选格式自动探测 */
     HX_S_FREQ,        /* 动态: 频率档(避让原值) */
     HX_S_MODE,        /* 动态: 算法模式(避让原值) */
     HX_S_PUSH_INV,    /* 动态: 推送开关取反 */
@@ -160,7 +162,7 @@ static HxCase_S G_Cases[] =
 {
     /* ---------- 安全组: 纯查询(默认模式执行) ---------- */
     { 0x00, 0x03, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0003版本查询",   "ver",     HX_S_FIXED, {0}, 0, HX_R_NONE },
-    { 0x00, 0x04, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0004频率查询",   "freq",    HX_S_FIXED, {0}, 0, HX_R_NONE },
+    { 0x00, 0x04, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0004频率查询",   "freq",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
     { 0x00, 0x06, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0006算法模式查询", "mode",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
     { 0x00, 0x07, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0007推送状态查询", "push",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
     { 0x00, 0x12, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0012PPS开关查询",  "pps",    HX_S_FIXED, {0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_NONE },
@@ -171,12 +173,13 @@ static HxCase_S G_Cases[] =
     { 0x01, 0x01, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0101A值查询",      "aval",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
     { 0x01, 0x03, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0103电池电量查询", "batt",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
 
-    /* 文档新增3.2.3.17: 量程查询(帧格式按设置帧同构: 类型1+值2填0+预留8; 文档未单列查询格式)
+    /* 文档新增3.2.3.17: 量程查询(文档仅给设置表, 查询帧格式缺失, 运行时按候选格式自动探测,
+       依据CAN侧0x115查询定义(类型+预留, 去值字段)优先; 命中格式在结果中标注)
        注意: 0x0022同时是数据包4推送ID, 期望应答帧长18过滤推送帧混叠 */
     { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022加速度量程查询", "accscale",
-      HX_S_FIXED, {0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 11, HX_R_NONE, 18 },
+      HX_S_SCALE_Q, {0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
     { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022角速度量程查询", "gyroscale",
-      HX_S_FIXED, {0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 11, HX_R_NONE, 18 },
+      HX_S_SCALE_Q, {0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
 
     /* ---------- 安全组: 无持久副作用的动作(写RAM, 掉电不保存) ---------- */
     { 0x00, 0x21, HEX_OP_RAM, HX_T_ACTION, HX_G_SAFE, "0x0021YAW角归零", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
@@ -1120,6 +1123,68 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
 }
 
 /**
+ * @brief 量程查询(0x0022): 文档3.2.3.17仅给"设置发送"表, 查询帧格式缺失,
+ *        按候选格式自动探测, 收到应答即视为命中格式(结果中标注)
+ *
+ * @note  候选依据: 1)CAN侧0x115查询定义(类型+预留, 去值字段)
+ *                 2)最简(仅类型1字节)
+ *                 3)设置帧同构(类型1+值2填0+预留8, 此格式真机已验证无应答, 置末)
+ */
+static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+{
+    static const struct
+    {
+        unsigned char DataLen;
+
+        const char *Desc;
+    } Fmt[] =
+    {
+        { 9,  "类型+预留8" },   /* CAN 0x115查询映射 */
+        { 1,  "类型1" },        /* 最简 */
+        { 11, "设置帧同构" },   /* 3.2.3.17设置表结构 */
+    };
+
+    unsigned char Data[16];
+
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    unsigned int f;
+
+    int n;
+
+    for (f = 0; f < (sizeof(Fmt) / sizeof(Fmt[0])); f++)
+    {
+        memset(Data, 0, sizeof(Data));
+
+        Data[0] = pC->Data[0]; /* 量程类型: 0x01加速度 / 0x02角速度 */
+
+        n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, Fmt[f].DataLen,
+                        pC->ExpectLen, Frame);
+
+        if (n > 0)
+        {
+            /* 收到应答: 该格式即固件接受的格式, 直接判定不再探测 */
+            if (CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
+                           pRes->Note, (int)sizeof(pRes->Note)) != 0)
+            {
+                char Tmp[HEX_VALS_MAX];
+
+                snprintf(Tmp, sizeof(Tmp), "[查询格式:%s] %s", Fmt[f].Desc, pRes->Vals);
+
+                snprintf(pRes->Vals, (int)sizeof(pRes->Vals), "%s", Tmp);
+
+                pRes->Pass = 1;
+            }
+
+            return;
+        }
+    }
+
+    snprintf(pRes->Note, sizeof(pRes->Note),
+             "3种查询帧格式(类型+预留8/类型1/设置帧同构)均无应答");
+}
+
+/**
  * @brief 执行单条用例(安静模式, 不打印过程)
  */
 static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
@@ -1137,6 +1202,13 @@ static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
     pRes->Note[0] = '\0';
 
     pRes->Done = 1;
+
+    if (pC->SetKind == HX_S_SCALE_Q)
+    {
+        RunScaleQuery(pDrv, pC, pRes);
+
+        return;
+    }
 
     if (BuildSetData(pC, Data, &DataLen) == 0)
     {
@@ -1239,7 +1311,7 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.6.0 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.6.1 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
