@@ -2,8 +2,8 @@
  * @file main.c
  * @author 杨镒铭
  * @brief Linux SocketCAN 测试验证程序(主程序: 初始化与线程管理)
- * @version V1.1.0
- * @date 2026-10-15
+ * @version V1.3.0
+ * @date    2026-10-21
  *
  * ****************************** 功能概述 ******************************
  *
@@ -79,6 +79,7 @@
 #include "drv_socketcan.h"    /* SocketCAN驱动层: 打开/收发/关闭 */
 #include "bsp_can_queue.h"    /* 帧级环形队列: 衔接收发两个线程 */
 #include "bsp_can_protocol.h" /* 协议层: 过滤器/推送开关/解析/统计 */
+#include "bsp_can_test.h"     /* CAN指令验证器: 功能2入口 */
 
 /* ================= 全局变量 ================= */
 
@@ -101,7 +102,7 @@ static BspCanQueue_S G_CanQueue;
 static volatile sig_atomic_t G_Running = 1;
 
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.2.1";
+static const char *G_Version = "V1.3.0";
 
 /** @brief 0x103开启推送指令按需下发参数:
  *  启动宽限: 套接字就绪后等这么久还没收到首帧才发;
@@ -249,16 +250,23 @@ int main(int argc, char *argv[])
     printf(" Linux SocketCAN CANStat Start\r\n");
     printf("====================================\r\n");
 
-    /* 参数检查: 第1个参数为CAN接口名, 第2个可选持续秒数 */
+    /* 参数检查: 第1个参数为CAN接口名, 第2个可选持续秒数或功能号 */
     if (argc < 2)
     {
         printf("Usage:\r\n");
         printf("    %s can0 [持续秒数(0=直到Ctrl-C)]\r\n", argv[0]);
+        printf("    %s can0 2 [0/1]  CAN指令验证(0=仅安全组, 1=含风险组)\r\n", argv[0]);
         return -1;
     }
 
     /* 获取CAN接口名(如can0/can1, 由SocketCAN驱动注册) */
     CanDev = argv[1];
+
+    /* 功能分发: 第2参数"2"=CAN指令验证, 其余按持续秒数解析(兼容旧用法) */
+    if ((argc >= 3) && (strcmp(argv[2], "2") == 0))
+    {
+        return BspCanTestRun(CanDev, (argc >= 4) ? atoi(argv[3]) : 0);
+    }
 
     if (argc >= 3)
     {
