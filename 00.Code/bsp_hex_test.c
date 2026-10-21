@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.4
+ * @version V1.6.5
  * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -30,6 +30,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.5<td>2026-10-21<td>杨镒铭<td>参照固件bsp_parse.c封装方式重构可读性: 新增19个报文ID常量(HEX_ID_xxx, 对应固件RECV_ID_xxx_E)与帧字段命名访问宏(HEX_FR_CMD/ID/LEN, HEX_RESP_DATA/DATALEN/DATA0, HEX_REQ_DATA), 用例表与解析代码全部替换魔法数字/下标, 行为不变
  * <tr><td>V1.6.4<td>2026-10-21<td>杨镒铭<td>固件量程应答已对齐文档(PayLoad 16改10): ExpectLen 24改回18直接命中, 宽容阶段保留兼容旧固件24字节行为
  * <tr><td>V1.6.3<td>2026-10-21<td>杨镒铭<td>0x22量程查询定因修复: 查阅固件工程(bsp_parse.c L1752)确认应答PayLoad=16字节/整帧24字节, 与文档回复表(18字节)不符 -> ExpectLen按固件实际改24, 之前18过滤吞掉应答致假超时; 固件查询分支只认DATA[0]类型不校验长度, 3格式探测均可达; 宽容阶段保留兼容文档式18
  * <tr><td>V1.6.2<td>2026-10-21<td>杨镒铭<td>0x22量程查询再加诊断: 3格式探测后增加不限应答长度的宽容收包(跳过数据包4推送帧), 应答值在档位表即通过并标注[宽容:应答Len=n]; 解析失败打印原始帧hex; 全无应答明确提示固件串口0x22查询可能未实现
@@ -68,6 +69,49 @@
 #define HEX_OP_QUERY  0x00          /* 查询 */
 #define HEX_OP_RAM    0x01          /* 配置到RAM, 掉电不保存 */
 #define HEX_OP_FLASH  0x02          /* 配置到FLASH, 掉电保存 */
+
+/*===========================================================
+=           报文ID与帧字段访问(参照固件bsp_parse.c封装方式)
+=  请求帧: AA 55 CMD ID Op Len(2,小端) DATA CRC(2) -> DATA在[7]
+=  应答帧: AA 55 CMD ID Len(2,小端) DATA CRC(2)    -> DATA在[6]
+===========================================================*/
+
+/** @brief 报文ID(完整16位, 帧内拆CMD=高字节/ID=低字节, 与固件RECV_ID_xxx_E对应) */
+#define HEX_ID_VERSION    0x0003    /* 版本查询 */
+#define HEX_ID_PUSH_FRE   0x0004    /* 推送频率 */
+#define HEX_ID_BLE_NAME   0x0005    /* 蓝牙名称(有意排除) */
+#define HEX_ID_ALGO_MODE  0x0006    /* 算法模式 */
+#define HEX_ID_PUSH_STAT  0x0007    /* 推送状态 */
+#define HEX_ID_MAG_CAL    0x0008    /* 磁力计校准 */
+#define HEX_ID_MSGID_CTL  0x0011    /* 推送报文ID控制 */
+#define HEX_ID_PPS        0x0012    /* PPS开关 */
+#define HEX_ID_RESET      0x0014    /* 复位重启 */
+#define HEX_ID_COORD      0x0015    /* 坐标系 */
+#define HEX_ID_UART_BAUD  0x0016    /* 串口波特率 */
+#define HEX_ID_CAN_BAUD   0x0017    /* CAN波特率 */
+#define HEX_ID_SN         0x0018    /* SN号 */
+#define HEX_ID_DATETIME   0x0019    /* 时间设置 */
+#define HEX_ID_ZERO_CAL   0x0020    /* 零偏校准 */
+#define HEX_ID_YAW_RESET  0x0021    /* YAW角归零 */
+#define HEX_ID_SCALE      0x0022    /* 加/角速度量程 */
+#define HEX_ID_AVALUE     0x0101    /* A值 */
+#define HEX_ID_BATTERY    0x0103    /* 电池电量 */
+
+/** @brief 完整报文ID拆帧字段: CMD=高字节, ID=低字节 */
+#define HEX_ID_H(id)  ((unsigned char)(((id) >> 8) & 0xFF))
+
+#define HEX_ID_L(id)  ((unsigned char)((id) & 0xFF))
+
+/** @brief 帧字段命名访问(替代魔法下标, 语义对应固件ZFlyHexFrameHead各字段) */
+#define HEX_FR_CMD(f)      ((f)[2])                                   /* 帧CMD */
+#define HEX_FR_ID(f)       ((f)[3])                                   /* 帧ID */
+#define HEX_FR_LEN(f)      ((int)((f)[4] | ((int)(f)[5] << 8)))       /* 整帧长(小端) */
+#define HEX_RESP_DATA(f)   (&(f)[6])                                  /* 应答DATA起始 */
+#define HEX_RESP_DATALEN(f) ((int)(HEX_FR_LEN(f)) - 8)                /* 应答DATA长度(减帧头6与CRC2) */
+#define HEX_RESP_DATA0(f)  ((f)[6])                                   /* 应答DATA[0](动作类应答码) */
+#define HEX_REQ_DATA(f)    (&(f)[7])                                  /* 请求DATA起始(含Op字段) */
+#define HEX_TYPE_ACC       0x01                                       /* 量程类型: 加速度(固件Buf[7]) */
+#define HEX_TYPE_GYRO      0x02                                       /* 量程类型: 角速度(固件Buf[7]) */
 
 /** @brief 用例类型 */
 typedef enum
@@ -168,28 +212,42 @@ static const unsigned int FreqHzList[] =
 static HxCase_S G_Cases[] =
 {
     /* ---------- 安全组: 纯查询(默认模式执行) ---------- */
-    { 0x00, 0x03, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0003版本查询",   "ver",     HX_S_FIXED, {0}, 0, HX_R_NONE },
-    { 0x00, 0x04, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0004频率查询",   "freq",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
-    { 0x00, 0x06, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0006算法模式查询", "mode",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
-    { 0x00, 0x07, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0007推送状态查询", "push",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
-    { 0x00, 0x12, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0012PPS开关查询",  "pps",    HX_S_FIXED, {0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_NONE },
-    { 0x00, 0x15, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0015坐标系查询",   "coord",  HX_S_FIXED, {0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_NONE },
-    { 0x00, 0x16, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0016串口波特率查询", "baud",  HX_S_FIXED, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 12, HX_R_NONE },
-    { 0x00, 0x17, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0017CAN波特率查询", "canbaud", HX_S_FIXED, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 12, HX_R_NONE },
-    { 0x00, 0x18, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0018SN号查询",     "sn",     HX_S_FIXED, {0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
-    { 0x01, 0x01, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0101A值查询",      "aval",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
-    { 0x01, 0x03, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0103电池电量查询", "batt",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_VERSION),   HEX_ID_L(HEX_ID_VERSION),   HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0003版本查询",     "ver",     HX_S_FIXED, {0}, 0, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_PUSH_FRE),  HEX_ID_L(HEX_ID_PUSH_FRE),  HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0004频率查询",     "freq",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_ALGO_MODE), HEX_ID_L(HEX_ID_ALGO_MODE), HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0006算法模式查询", "mode",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_PUSH_STAT), HEX_ID_L(HEX_ID_PUSH_STAT), HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0007推送状态查询", "push",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_PPS),       HEX_ID_L(HEX_ID_PPS),       HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0012PPS开关查询",  "pps",     HX_S_FIXED, {0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_COORD),     HEX_ID_L(HEX_ID_COORD),     HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0015坐标系查询",   "coord",   HX_S_FIXED, {0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_UART_BAUD), HEX_ID_L(HEX_ID_UART_BAUD), HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0016串口波特率查询", "baud",  HX_S_FIXED, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 12, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_CAN_BAUD),  HEX_ID_L(HEX_ID_CAN_BAUD),  HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0017CAN波特率查询", "canbaud", HX_S_FIXED, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 12, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_SN),        HEX_ID_L(HEX_ID_SN),        HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0018SN号查询",     "sn",      HX_S_FIXED, {0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_AVALUE),    HEX_ID_L(HEX_ID_AVALUE),    HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0101A值查询",      "aval",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_BATTERY),   HEX_ID_L(HEX_ID_BATTERY),   HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0103电池电量查询", "batt",    HX_S_FIXED, {0x00}, 1, HX_R_NONE },
 
     /* 文档新增3.2.3.17: 量程查询(固件查询分支只认DATA[0]类型字节, 不校验DATA长度)
        应答帧长: 固件已对齐文档回复表(PayLoad=10/整帧18, 2026-10-21修改);
        旧固件曾为PayLoad=16/整帧24, 宽容阶段兜底兼容; 跳过数据包4推送帧(46)防混叠 */
-    { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022加速度量程查询", "accscale",
-      HX_S_SCALE_Q, {0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
-    { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022角速度量程查询", "gyroscale",
-      HX_S_SCALE_Q, {0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
+    { HEX_ID_H(HEX_ID_SCALE), HEX_ID_L(HEX_ID_SCALE), HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0022加速度量程查询", "accscale",
+      HX_S_SCALE_Q, {HEX_TYPE_ACC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
+    { HEX_ID_H(HEX_ID_SCALE), HEX_ID_L(HEX_ID_SCALE), HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE,
+      "0x0022角速度量程查询", "gyroscale",
+      HX_S_SCALE_Q, {HEX_TYPE_GYRO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, HX_R_NONE, 18 },
 
     /* ---------- 安全组: 无持久副作用的动作(写RAM, 掉电不保存) ---------- */
-    { 0x00, 0x21, HEX_OP_RAM, HX_T_ACTION, HX_G_SAFE, "0x0021YAW角归零", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_YAW_RESET), HEX_ID_L(HEX_ID_YAW_RESET), HEX_OP_RAM, HX_T_ACTION, HX_G_SAFE,
+      "0x0021YAW角归零", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
 
     /* ---------- 有意排除项(覆盖说明, 不下发) ----------
      * 0x0005蓝牙名称: 直接配置到蓝牙且掉电保存, 无法自动还原, 排除
@@ -199,18 +257,29 @@ static HxCase_S G_Cases[] =
      * 0x0019时间设置: 无查询报文, 无法取原时间还原, 以"同步主机当前时间"方式覆盖(掉电不保存) */
 
     /* ---------- 风险组: 写RAM改配置, 验证后依据查询缓存自动还原 ---------- */
-    { 0x00, 0x04, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0004频率设10Hz(RAM)", NULL, HX_S_FREQ,      {0}, 0, HX_R_FREQ },
-    { 0x00, 0x06, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0006模式设6轴DMP(RAM)", NULL, HX_S_MODE,    {0}, 0, HX_R_MODE },
-    { 0x00, 0x07, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0007推送状态取反(RAM)", NULL, HX_S_PUSH_INV, {0}, 0, HX_R_PUSH },
-    { 0x00, 0x11, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0011开0x0022推送(RAM)", NULL, HX_S_FIXED, {0x00, 0x22, 0x01}, 3, HX_R_MSG22_OFF },
-    { 0x00, 0x12, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0012PPS开关取反(RAM)", NULL, HX_S_PPS_INV,  {0}, 0, HX_R_PPS },
-    { 0x00, 0x15, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0015坐标系切换(RAM)", NULL, HX_S_COORD_ALT, {0}, 0, HX_R_COORD },
-    { 0x00, 0x08, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0008开磁力计校准", NULL, HX_S_FIXED, {0x01}, 1, HX_R_MAG_OFF },
-    { 0x00, 0x20, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0020开零偏校准(需静止)", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_ZERO_OFF },
-    { 0x00, 0x19, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0019时间同步主机时间", NULL, HX_S_TIME_NOW, {0}, 0, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_PUSH_FRE),  HEX_ID_L(HEX_ID_PUSH_FRE),  HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0004频率设10Hz(RAM)", NULL, HX_S_FREQ, {0}, 0, HX_R_FREQ },
+    { HEX_ID_H(HEX_ID_ALGO_MODE), HEX_ID_L(HEX_ID_ALGO_MODE), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0006模式设6轴DMP(RAM)", NULL, HX_S_MODE, {0}, 0, HX_R_MODE },
+    { HEX_ID_H(HEX_ID_PUSH_STAT), HEX_ID_L(HEX_ID_PUSH_STAT), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0007推送状态取反(RAM)", NULL, HX_S_PUSH_INV, {0}, 0, HX_R_PUSH },
+    { HEX_ID_H(HEX_ID_MSGID_CTL), HEX_ID_L(HEX_ID_MSGID_CTL), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0011开0x0022推送(RAM)", NULL, HX_S_FIXED,
+      {0x00, HEX_ID_L(HEX_ID_SCALE), 0x01}, 3, HX_R_MSG22_OFF }, /* Buf[7]ID高 Buf[8]ID低 Buf[9]开关 */
+    { HEX_ID_H(HEX_ID_PPS),   HEX_ID_L(HEX_ID_PPS),   HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0012PPS开关取反(RAM)", NULL, HX_S_PPS_INV, {0}, 0, HX_R_PPS },
+    { HEX_ID_H(HEX_ID_COORD), HEX_ID_L(HEX_ID_COORD), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0015坐标系切换(RAM)", NULL, HX_S_COORD_ALT, {0}, 0, HX_R_COORD },
+    { HEX_ID_H(HEX_ID_MAG_CAL), HEX_ID_L(HEX_ID_MAG_CAL), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0008开磁力计校准", NULL, HX_S_FIXED, {0x01}, 1, HX_R_MAG_OFF },
+    { HEX_ID_H(HEX_ID_ZERO_CAL), HEX_ID_L(HEX_ID_ZERO_CAL), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0020开零偏校准(需静止)", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_ZERO_OFF },
+    { HEX_ID_H(HEX_ID_DATETIME), HEX_ID_L(HEX_ID_DATETIME), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0019时间同步主机时间", NULL, HX_S_TIME_NOW, {0}, 0, HX_R_NONE },
 
     /* 复位重启: 会断流数秒, 固定放用例表末尾最后执行 */
-    { 0x00, 0x14, HEX_OP_RAM, HX_T_ACTION, HX_G_RISK, "0x0014复位重启", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
+    { HEX_ID_H(HEX_ID_RESET), HEX_ID_L(HEX_ID_RESET), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
+      "0x0014复位重启", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
 };
 
 #define CASE_NUM (sizeof(G_Cases) / sizeof(G_Cases[0]))
@@ -610,9 +679,9 @@ static int BaudInList(unsigned int v, const unsigned int *pList, unsigned int Nu
 static int CheckQuery(const HxCase_S *pC, const unsigned char *pFrame, int FrameLen,
                       char *pVals, int ValsSize, char *pNote, int NoteSize)
 {
-    const unsigned char *pD = &pFrame[6]; /* 应答DATA起始(AA55 CMD ID Len2之后) */
+    const unsigned char *pD = HEX_RESP_DATA(pFrame); /* 应答DATA起始 */
 
-    int DataN = FrameLen - 8;             /* 整帧-帧头6-CRC2 */
+    int DataN = HEX_RESP_DATALEN(pFrame);            /* 应答DATA长度 */
 
     if (strcmp(pC->Expect, "ver") == 0)
     {
@@ -1135,7 +1204,7 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
         return 0;
     }
 
-    return (Frame[6] == 0x00) ? 1 : 0; /* 应答DATA[0]==0x00视为还原成功 */
+    return (HEX_RESP_DATA0(Frame) == 0x00) ? 1 : 0; /* 应答DATA[0]==0x00视为还原成功 */
 }
 
 /**
@@ -1305,16 +1374,16 @@ static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
     }
     else /* 动作类: 应答DATA[0]==0x00即过 */
     {
-        if ((n - 8) < 1)
+        if (HEX_RESP_DATALEN(Frame) < 1)
         {
             snprintf(pRes->Note, sizeof(pRes->Note), "应答无DATA域");
 
             return;
         }
 
-        if (Frame[6] != 0x00)
+        if (HEX_RESP_DATA0(Frame) != 0x00)
         {
-            snprintf(pRes->Note, sizeof(pRes->Note), "应答码0x%02X非0x00", Frame[6]);
+            snprintf(pRes->Note, sizeof(pRes->Note), "应答码0x%02X非0x00", HEX_RESP_DATA0(Frame));
 
             return;
         }
@@ -1371,7 +1440,7 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.6.4 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.6.5 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
