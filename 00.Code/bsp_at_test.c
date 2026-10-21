@@ -2,8 +2,8 @@
  *******************************************************************************
  * @file    bsp_at_test.c
  * @author  杨镒铭
- * @version V1.5.0
- * @date    2026-10-20
+ * @version V1.6.0
+ * @date    2026-10-21
  * @brief   志翔IMU AT指令逐条验证器(由main.c统一入口调用, 单程序整合版)
  *
  * @detail
@@ -21,6 +21,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.0<td>2026-10-21<td>杨镒铭<td>补文档新增量程配置覆盖: ACCSCALECFG/GYROSCALECFG查询(安全组)+设置(风险组, 查原值设避让档后还原原值)
  * <tr><td>V1.5.0<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspAtTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
  * <tr><td>V1.4.0<td>2026-10-20<td>杨镒铭<td>补齐文档指令覆盖: 新增CANBAUD?查询与DATALINK/MSGID=13/PPSMODE/ZEROBIASCAL风险组(成对自动还原); DATATIME=设置先查原时间验证后自动还原; RST复位重启置表末
  * <tr><td>V1.3.1<td>2026-10-15<td>杨镒铭<td>输出整理: 每条一行+末尾汇总表; 修数据流混流假FAIL(全缓冲搜OK+过滤二进制); 修banner字面转义
@@ -55,7 +56,8 @@ typedef enum
 {
     AT_T_QUERY = 0,   /* 查询类: 匹配应答模式+OK */
     AT_T_ACTION,      /* 动作类: 应答OK即过 */
-    AT_T_TIMESET      /* 时间设置类: 先存原时间, 验证后还原(掉电不保存) */
+    AT_T_TIMESET,     /* 时间设置类: 先存原时间, 验证后还原(掉电不保存) */
+    AT_T_SCALESET     /* 量程设置类: 先查原量程, 设避让档验证后还原原值 */
 } AtCaseType_E;
 
 /** @brief 风险等级 */
@@ -68,12 +70,15 @@ typedef enum
 /** @brief 单条用例定义 */
 typedef struct
 {
-    const char *Cmd;              /* 完整指令文本(发送时自动补回车换行) */
+    const char *Cmd;              /* 完整指令文本(发送时自动补回车换行; 量程类为%d模板) */
     AtCaseType_E Type;            /* 查询/动作 */
     AtGroup_E Group;              /* 安全/风险 */
     const char *Desc;             /* 用途说明 */
     const char *RestoreCmd;       /* 验证后的还原指令(NULL=无需还原) */
     const char *Expect;           /* 查询类应答关键字(逗号分隔, 空串=仅OK) */
+    const char *QueryCmd;         /* 量程类: 原值查询指令 */
+    const char *GetKey;           /* 量程类: 应答中提取原值的关键字(如AccScaleCfg:) */
+    const char *ScaleList;        /* 量程类: 档位表(逗号分隔, 如"2,4,8,16") */
 } AtCase_S;
 
 /** @brief 单条用例执行结果 */
@@ -107,6 +112,9 @@ static AtCase_S G_Cases[] =
     { "AT+GRAPHRQ?",    AT_T_QUERY, AT_G_SAFE, "主图推送频率查询",  NULL, "DataPushFre:" },
     { "AT+ORIGRQ?",     AT_T_QUERY, AT_G_SAFE, "原始数据频率查询",  NULL, "DataPushFre:" },
     { "AT+CANBAUD?",    AT_T_QUERY, AT_G_SAFE, "CAN波特率查询",     NULL, "CANBaudRate:" },
+    { "AT+FLASHCFG",    AT_T_QUERY, AT_G_SAFE, "Flash配置查询",     NULL, "" },
+    { "AT+ACCSCALECFG?",  AT_T_QUERY, AT_G_SAFE, "加速度量程查询",  NULL, "AccScaleCfg:" },
+    { "AT+GYROSCALECFG?", AT_T_QUERY, AT_G_SAFE, "角速度量程查询",  NULL, "GyroScaleCfg:" },
 
     /* ---------- 安全组: 无持久副作用的动作 ---------- */
     { "AT+SET=OFF",     AT_T_ACTION, AT_G_SAFE, "关数据流", "AT+SET=ON", "" },
@@ -132,7 +140,13 @@ static AtCase_S G_Cases[] =
     { "AT+PPSMODE=1",       AT_T_ACTION, AT_G_RISK, "PPS模式配1",       "AT+PPSMODE=2", "" },
     { "AT+PPSMODE=2",       AT_T_ACTION, AT_G_RISK, "还原PPS模式2",     NULL, "" },
     { "AT+ZEROBIASCAL=ON",  AT_T_ACTION, AT_G_RISK, "零偏校准(需静止)", "AT+ZEROBIASCAL=OFF", "" },
-    { "AT+ZEROBIASCAL=OFF", AT_T_ACTION, AT_G_RISK, "关零偏校准",       NULL, "" },
+    { "AT+ZEROBIASCAL=OFF", AT_T_ACTION, AT_G_RISK, "关零偏校准", NULL, "" },
+
+    /* 量程配置(文档新增): 查原值->设避让档->还原原值(注: HEX版同指令为FLASH保存, AT版验证后写回原值) */
+    { "AT+ACCSCALECFG=%d",  AT_T_SCALESET, AT_G_RISK, "加速度量程配置(还原原值)",  NULL, "",
+      "AT+ACCSCALECFG?",  "AccScaleCfg:",  "2,4,8,16" },
+    { "AT+GYROSCALECFG=%d", AT_T_SCALESET, AT_G_RISK, "角速度量程配置(还原原值)", NULL, "",
+      "AT+GYROSCALECFG?", "GyroScaleCfg:", "250,500,1000,2000" },
 
     /* 时间设置: 掉电不保存, 先查原时间, 验证后自动还原, 避免改动设备时间 */
     { "AT+DATATIME=2026 1 1-00:00:00", AT_T_TIMESET, AT_G_RISK, "设置系统时间(还原原时间)", NULL, "" },
@@ -488,6 +502,96 @@ static void RunTimeSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
 }
 
 /**
+ * @brief 量程设置类用例: 查原量程 -> 设避让档 -> 还原原量程
+ *
+ * @note  HEX版同指令为FLASH保存; AT版验证后立即写回原值, 设备最终状态不变
+ */
+static void RunScaleSetCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
+{
+    static char Resp[AT_RESP_MAX];
+
+    char Cmd[AT_LINE_MAX];
+
+    char List[64];
+
+    const char *p;
+
+    char *Tok;
+
+    int Orig = 0;
+
+    int NewVal = 0;
+
+    int InList = 0;
+
+    /* 1. 查询原量程, 取不到则不动设备配置 */
+    if ((AtSend(pDrv, pCase->QueryCmd) != 0) ||
+        (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0) ||
+        ((p = strstr(Resp, pCase->GetKey)) == NULL))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "查询原量程失败, 跳过以免无法还原");
+
+        return;
+    }
+
+    Orig = atoi(p + strlen(pCase->GetKey));
+
+    /* 2. 档位表内取第一个异于原值的档, 并确认原值合法 */
+    strncpy(List, pCase->ScaleList, sizeof(List) - 1);
+
+    List[sizeof(List) - 1] = '\0';
+
+    Tok = strtok(List, ",");
+
+    while (Tok != NULL)
+    {
+        int v = atoi(Tok);
+
+        if (v == Orig)
+        {
+            InList = 1;
+        }
+        else if (NewVal == 0)
+        {
+            NewVal = v;
+        }
+
+        Tok = strtok(NULL, ",");
+    }
+
+    if ((InList == 0) || (NewVal == 0) || (NewVal == Orig))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "原量程%d不在档位表(%s)", Orig, pCase->ScaleList);
+
+        return;
+    }
+
+    /* 3. 设避让档验证 */
+    snprintf(Cmd, sizeof(Cmd), pCase->Cmd, NewVal);
+
+    if ((AtSend(pDrv, Cmd) != 0) || (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "设%d未收到OK", NewVal);
+
+        return;
+    }
+
+    /* 4. 还原原量程 */
+    snprintf(Cmd, sizeof(Cmd), pCase->Cmd, Orig);
+
+    if ((AtSend(pDrv, Cmd) != 0) || (AtRecvResp(pDrv, Resp, AT_RESP_TIMEOUT_MS) == 0))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "还原%d失败", Orig);
+
+        return;
+    }
+
+    snprintf(pRes->Vals, sizeof(pRes->Vals), "设%d验证后还原%d", NewVal, Orig);
+
+    pRes->Pass = 1;
+}
+
+/**
  * @brief 执行单条用例(安静模式, 不打印过程)
  */
 static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
@@ -503,6 +607,13 @@ static void RunCase(DrvSerial_S *pDrv, AtCase_S *pCase, AtResult_S *pRes)
     if (pCase->Type == AT_T_TIMESET)
     {
         RunTimeSetCase(pDrv, pCase, pRes);
+
+        return;
+    }
+
+    if (pCase->Type == AT_T_SCALESET)
+    {
+        RunScaleSetCase(pDrv, pCase, pRes);
 
         return;
     }

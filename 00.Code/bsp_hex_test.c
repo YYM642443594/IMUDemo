@@ -2,8 +2,8 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.5.2
- * @date    2026-10-20
+ * @version V1.6.0
+ * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
  * @detail
@@ -18,7 +18,7 @@
  *   - 接收与数据流混流容错: 滑窗搜索帧头+CMD/ID匹配+CRC校验, 剔除推送报文噪声
  *   - 输出为安静模式: 每条用例一行, 结束后输出汇总表
  *
- * @note  覆盖范围(3.2.2表16个ID + 3.2.3详述的0x0020零偏/0x0021 YAW归零, 共18个):
+ * @note  覆盖范围(3.2.2报文ID表19个交互ID: 0x03/04/05/06/07/08/11/12/14/15/16/17/18/19/20/21/22/0x0101/0x0103):
  *        有意排除项(用例表内注释): 蓝牙名称0x0005写入(直接写蓝牙掉电保存无法还原),
  *        串口/CAN波特率写入(仅支持配置到FLASH且重启生效会断链),
  *        各ID的FLASH配置档(0x02, 掉电保存), 时间0x0019无查询报文故以主机时间同步验证
@@ -26,6 +26,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.0<td>2026-10-21<td>杨镒铭<td>补文档新增量程配置: 0x0022加/角速度量程查询(安全组, 应答帧长过滤防与数据包4推送混叠); 0x0022设置档为FLASH-only有意排除
  * <tr><td>V1.5.2<td>2026-10-20<td>杨镒铭<td>整合为单程序: main()改为BspHexTestRun(Dev,Baud,Mode)供main.c统一入口分发, 不再单独编译可执行
  * <tr><td>V1.5.1<td>2026-10-20<td>杨镒铭<td>输出对齐: 名称列改按UTF-8显示宽度补空格(中文按2列), 逐条行与汇总表PASS/FAIL列对齐
  * <tr><td>V1.5.0<td>2026-10-20<td>杨镒铭<td>创建: 18个报文ID全覆盖, 安全组11查询+YAW归零,
@@ -109,11 +110,12 @@ typedef struct
     HxCaseType_E Type;            /* 查询/动作 */
     HxGroup_E Group;              /* 安全/风险 */
     const char *Name;             /* 用例显示名 */
-    const char *Expect;           /* 查询类值域校验键(ver/freq/mode/push/pps/coord/baud/canbaud/sn/aval/batt) */
+    const char *Expect;           /* 查询类值域校验键(ver/freq/mode/push/pps/coord/baud/canbaud/sn/aval/batt/accscale/gyroscale) */
     HxSetKind_E SetKind;          /* 发送数据构造方式 */
     unsigned char Data[16];       /* 固定发送数据(SetKind=FIXED时生效) */
     unsigned char DataLen;        /* 固定发送数据长度(0=无DATA域, 如0x03/0x04查询) */
     HxRestoreKind_E Restore;      /* 通过后的还原方式 */
+    unsigned char ExpectLen;      /* 期望应答帧长(0=不限; >0时长度不符的匹配帧滑过, 防同ID推送帧混叠) */
 } HxCase_S;
 
 /** @brief 单条用例执行结果 */
@@ -169,12 +171,20 @@ static HxCase_S G_Cases[] =
     { 0x01, 0x01, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0101A值查询",      "aval",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
     { 0x01, 0x03, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0103电池电量查询", "batt",   HX_S_FIXED, {0x00}, 1, HX_R_NONE },
 
+    /* 文档新增3.2.3.17: 量程查询(帧格式按设置帧同构: 类型1+值2填0+预留8; 文档未单列查询格式)
+       注意: 0x0022同时是数据包4推送ID, 期望应答帧长18过滤推送帧混叠 */
+    { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022加速度量程查询", "accscale",
+      HX_S_FIXED, {0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 11, HX_R_NONE, 18 },
+    { 0x00, 0x22, HEX_OP_QUERY, HX_T_QUERY, HX_G_SAFE, "0x0022角速度量程查询", "gyroscale",
+      HX_S_FIXED, {0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}, 11, HX_R_NONE, 18 },
+
     /* ---------- 安全组: 无持久副作用的动作(写RAM, 掉电不保存) ---------- */
     { 0x00, 0x21, HEX_OP_RAM, HX_T_ACTION, HX_G_SAFE, "0x0021YAW角归零", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_NONE },
 
     /* ---------- 有意排除项(覆盖说明, 不下发) ----------
      * 0x0005蓝牙名称: 直接配置到蓝牙且掉电保存, 无法自动还原, 排除
      * 0x0016/0x0017写入: 仅支持配置到FLASH且重启生效, 会断链, 排除
+     * 0x0022量程写入(3.2.3.17): 仅支持FLASH档(掉电保存), 排除; 查询档已覆盖
      * 0x0004/0x0006/0x0007/0x0011/0x0012/0x0015的FLASH档(0x02): 掉电保存, 仅验证RAM档
      * 0x0019时间设置: 无查询报文, 无法取原时间还原, 以"同步主机当前时间"方式覆盖(掉电不保存) */
 
@@ -383,9 +393,12 @@ static int HexBuildReq(unsigned char Cmd, unsigned char Id, unsigned char Op,
 /**
  * @brief 从滑窗缓冲提取一帧匹配CMD/ID且CRC通过的应答帧(剔除非匹配帧/坏帧)
  *
+ * @param ExpectLen 期望应答帧长(0=不限; >0时长度不符的同ID帧滑过, 防推送帧混叠)
+ *
  * @return >0=整帧长度(复制到pFrame) 0=缓冲中暂无完整匹配帧
  */
-static int TryExtractFrame(unsigned char Cmd, unsigned char Id, unsigned char *pFrame)
+static int TryExtractFrame(unsigned char Cmd, unsigned char Id, int ExpectLen,
+                           unsigned char *pFrame)
 {
     int i = 0;
 
@@ -428,6 +441,13 @@ static int TryExtractFrame(unsigned char Cmd, unsigned char Id, unsigned char *p
             if (HexCrc16(&G_RxBuf[i], (unsigned short)(Len - 2)) ==
                 (uint16_t)(G_RxBuf[i + Len - 2] | ((uint16_t)G_RxBuf[i + Len - 1] << 8)))
             {
+                if ((ExpectLen > 0) && (Len != ExpectLen))
+                {
+                    i++; /* 同ID推送帧(如0x0022数据包4): CRC通过但长度不符, 滑过继续找 */
+
+                    continue;
+                }
+
                 memcpy(pFrame, &G_RxBuf[i], (size_t)Len);
 
                 memmove(G_RxBuf, &G_RxBuf[i + Len], (size_t)(G_RxLen - i - Len));
@@ -457,7 +477,7 @@ static int TryExtractFrame(unsigned char Cmd, unsigned char Id, unsigned char *p
  * @return >0=整帧长度 0=超时未收到匹配帧
  */
 static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
-                        unsigned char *pFrame, double TimeoutMs)
+                        int ExpectLen, unsigned char *pFrame, double TimeoutMs)
 {
     unsigned char Buf[256];
 
@@ -490,7 +510,7 @@ static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
             }
         }
 
-        Got = TryExtractFrame(Cmd, Id, pFrame);
+        Got = TryExtractFrame(Cmd, Id, ExpectLen, pFrame);
 
         if (Got > 0)
         {
@@ -504,10 +524,13 @@ static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
 /**
  * @brief 事务: 清缓冲->构造帧->发送->收应答
  *
+ * @param ExpectLen 期望应答帧长(0=不限)
+ *
  * @return >0=应答帧长 -1=发送失败 0=超时
  */
 static int HexTransact(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id, unsigned char Op,
-                       const unsigned char *pData, unsigned char DataLen, unsigned char *pFrame)
+                       const unsigned char *pData, unsigned char DataLen,
+                       int ExpectLen, unsigned char *pFrame)
 {
     unsigned char Req[HEX_FRAME_MAX];
 
@@ -524,7 +547,7 @@ static int HexTransact(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id, u
         return -1;
     }
 
-    return HexRecvFrame(pDrv, Cmd, Id, pFrame, HEX_RESP_TIMEOUT_MS);
+    return HexRecvFrame(pDrv, Cmd, Id, ExpectLen, pFrame, HEX_RESP_TIMEOUT_MS);
 }
 
 /**
@@ -815,6 +838,66 @@ static int CheckQuery(const HxCase_S *pC, const unsigned char *pFrame, int Frame
 
         snprintf(pVals, (size_t)ValsSize, "电量:%d%%", pD[0]);
     }
+    else if ((strcmp(pC->Expect, "accscale") == 0) || (strcmp(pC->Expect, "gyroscale") == 0))
+    {
+        /* 3.2.3.17: 应答DATA=量程值2(小端)+预留8, 值域档位白名单 */
+        static const unsigned short AccScaleList[]  = { 2, 4, 8, 16 };
+
+        static const unsigned short GyroScaleList[] = { 250, 500, 1000, 2000 };
+
+        const unsigned short *pList;
+
+        unsigned int ListNum;
+
+        unsigned int k;
+
+        int Hit = 0;
+
+        unsigned int v;
+
+        if (DataN < 2)
+        {
+            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需2)", DataN);
+
+            return 0;
+        }
+
+        if (pC->Expect[0] == 'a')
+        {
+            pList = AccScaleList;
+
+            ListNum = sizeof(AccScaleList) / sizeof(AccScaleList[0]);
+        }
+        else
+        {
+            pList = GyroScaleList;
+
+            ListNum = sizeof(GyroScaleList) / sizeof(GyroScaleList[0]);
+        }
+
+        v = (unsigned int)pD[0] | ((unsigned int)pD[1] << 8);
+
+        for (k = 0; k < ListNum; k++)
+        {
+            if (pList[k] == v)
+            {
+                Hit = 1;
+
+                break;
+            }
+        }
+
+        if (Hit == 0)
+        {
+            snprintf(pNote, (size_t)NoteSize, "量程%u不在档位表", v);
+
+            return 0;
+        }
+
+        snprintf(pVals, (size_t)ValsSize, "%s量程:%u%s",
+                 (pC->Expect[0] == 'a') ? "加速度" : "角速度", v,
+                 (pC->Expect[0] == 'a') ? "g" : "\xC2\xB0/s");
+    }
     else
     {
         pVals[0] = '\0'; /* 无值域要求: 帧CRC通过即可 */
@@ -1026,7 +1109,7 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
             return 1;
     }
 
-    n = HexTransact(pDrv, pC->Cmd, pC->Id, HEX_OP_RAM, Data, DataLen, Frame);
+    n = HexTransact(pDrv, pC->Cmd, pC->Id, HEX_OP_RAM, Data, DataLen, 0, Frame);
 
     if (n <= 0)
     {
@@ -1064,7 +1147,7 @@ static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
         return;
     }
 
-    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, DataLen, Frame);
+    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, DataLen, pC->ExpectLen, Frame);
 
     if (n == -1)
     {
@@ -1156,7 +1239,7 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.5.2 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.6.0 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)

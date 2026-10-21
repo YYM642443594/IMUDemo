@@ -2,8 +2,8 @@
  *******************************************************************************
  * @file    main.c
  * @author  杨镒铭
- * @version V1.6.0
- * @date    2026-10-20
+ * @version V1.7.0
+ * @date    2026-10-21
  * @brief   Linux串口IMU验证工具统一入口(UART版: 数据流统计/AT指令/HEX协议)
  *
  * @detail
@@ -34,6 +34,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.7.0<td>2026-10-21<td>杨镒铭<td>补文档新增量程配置覆盖: AT侧ACCSCALECFG/GYROSCALECFG查询+设置(查原值设避让档还原), HEX侧0x0022量程查询(应答帧长过滤防数据包4混叠)
  * <tr><td>V1.6.0<td>2026-10-20<td>杨镒铭<td>单程序整合: AT/HEX验证并入统一入口(功能2/3), 不再单独编译at_test/hex_test; 兼容旧用法(第3参数非2/3时按持续秒数处理)
  * <tr><td>V1.0.0<td>2026-10-15<td>杨镒铭<td>创建
  *   <tr><td>V1.1.0<td>2026-10-15<td>杨镒铭<td>新增数据包2/3/4设备时间戳差值Δt统计与诊断计数
@@ -65,7 +66,7 @@
 ===========================================================*/
 
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.6.0";
+static const char *G_Version = "V1.7.0";
 
 /** @brief 串口驱动控制块 */
 static DrvSerial_S G_Serial = { .Fd = -1, .Dev = "/dev/ttyUSB0", .Baud = 921600 };
