@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.5
+ * @version V1.6.6
  * @date    2026-10-21
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -17,6 +17,7 @@
  *   - 风险组验证后自动还原: 依据安全组查询缓存构造还原帧(还原动作不计分)
  *   - 接收与数据流混流容错: 滑窗搜索帧头+CMD/ID匹配+CRC校验, 剔除推送报文噪声
  *   - 输出为安静模式: 每条用例一行, 结束后输出汇总表
+ *   - 代码风格: 单函数体不超过30行(约20行为宜), 超出即按职责拆分
  *
  * @note  覆盖范围(3.2.2报文ID表19个交互ID: 0x03/04/05/06/07/08/11/12/14/15/16/17/18/19/20/21/22/0x0101/0x0103):
  *        帧格式已逐ID对照固件工程核实(00.FTP/IMU_103_303_333 bsp_parse.c, 2026-10-21):
@@ -25,11 +26,13 @@
  *        0x19:8/0x20:9/0x21:9/0x0101:1/0x0103:1); 0x0014复位仅RAM档(Op=0x01)应答并复位
  *        有意排除项(用例表内注释): 蓝牙名称0x0005写入(直接写蓝牙掉电保存无法还原),
  *        串口/CAN波特率写入(仅支持配置到FLASH且重启生效会断链),
- *        各ID的FLASH配置档(0x02, 掉电保存), 时间0x0019无查询报文故以主机时间同步验证
+ *        0x0022量程写入(3.2.3.17仅支持FLASH档,掉电保存), 各ID的FLASH档(0x02,掉电保存),
+ *        时间0x0019无查询报文故以主机时间同步验证(掉电不保存)
  *
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.6<td>2026-10-21<td>杨镒铭<td>函数长度规范重构(单函数≤30行): CheckQuery按校验键拆12个小函数+分发表, BuildSetData/RunRestore按类型拆构造函数, RunScaleQuery拆探测/诊断两阶段, 主流程拆单条执行/汇总/失败清单, TryExtractFrame/HexRecvFrame/RunCase等同步拆分, 行为不变
  * <tr><td>V1.6.5<td>2026-10-21<td>杨镒铭<td>参照固件bsp_parse.c封装方式重构可读性: 新增19个报文ID常量(HEX_ID_xxx, 对应固件RECV_ID_xxx_E)与帧字段命名访问宏(HEX_FR_CMD/ID/LEN, HEX_RESP_DATA/DATALEN/DATA0, HEX_REQ_DATA), 用例表与解析代码全部替换魔法数字/下标, 行为不变
  * <tr><td>V1.6.4<td>2026-10-21<td>杨镒铭<td>固件量程应答已对齐文档(PayLoad 16改10): ExpectLen 24改回18直接命中, 宽容阶段保留兼容旧固件24字节行为
  * <tr><td>V1.6.3<td>2026-10-21<td>杨镒铭<td>0x22量程查询定因修复: 查阅固件工程(bsp_parse.c L1752)确认应答PayLoad=16字节/整帧24字节, 与文档回复表(18字节)不符 -> ExpectLen按固件实际改24, 之前18过滤吞掉应答致假超时; 固件查询分支只认DATA[0]类型不校验长度, 3格式探测均可达; 宽容阶段保留兼容文档式18
@@ -49,12 +52,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
 #include <termios.h>
 
 #include "drv_serial.h"
+#include "bsp_hex_test.h"
 
 /*===========================================================
 =                       配置与常量
@@ -166,7 +171,7 @@ typedef struct
     const char *Expect;           /* 查询类值域校验键(ver/freq/mode/push/pps/coord/baud/canbaud/sn/aval/batt/accscale/gyroscale) */
     HxSetKind_E SetKind;          /* 发送数据构造方式 */
     unsigned char Data[16];       /* 固定发送数据(SetKind=FIXED时生效) */
-    unsigned char DataLen;        /* 固定发送数据长度(0=无DATA域, 如0x03/0x04查询) */
+    unsigned char DataLen;        /* 固定发送数据长度(0=无DATA域, 如0x03查询) */
     HxRestoreKind_E Restore;      /* 通过后的还原方式 */
     unsigned char ExpectLen;      /* 期望应答帧长(0=不限; >0时长度不符的匹配帧滑过, 防同ID推送帧混叠) */
 } HxCase_S;
@@ -428,6 +433,10 @@ static uint16_t HexCrc16(const unsigned char *pBuf, unsigned short n)
     return Crc;
 }
 
+/*===========================================================
+=                       帧构造与接收
+===========================================================*/
+
 /**
  * @brief 构造请求帧: AA 55 CMD ID Op Len(2,小端,整帧长) DATA CRC16(2,小端)
  *
@@ -438,21 +447,14 @@ static int HexBuildReq(unsigned char Cmd, unsigned char Id, unsigned char Op,
                        unsigned char *pOut)
 {
     int Len = 9 + DataLen; /* 帧头7(AA55 CMD ID Op Len2) + DATA + CRC2 */
-
     uint16_t Crc;
 
     pOut[0] = 0xAA;
-
     pOut[1] = 0x55;
-
     pOut[2] = Cmd;
-
     pOut[3] = Id;
-
     pOut[4] = Op;
-
     pOut[5] = (unsigned char)(Len & 0xFF);
-
     pOut[6] = (unsigned char)((Len >> 8) & 0xFF);
 
     if (DataLen > 0)
@@ -461,12 +463,114 @@ static int HexBuildReq(unsigned char Cmd, unsigned char Id, unsigned char Op,
     }
 
     Crc = HexCrc16(pOut, (unsigned short)(Len - 2));
-
     pOut[Len - 2] = (unsigned char)(Crc & 0xFF);
-
     pOut[Len - 1] = (unsigned char)((Crc >> 8) & 0xFF);
 
     return Len;
+}
+
+/**
+ * @brief 位置i处长度Len的帧CRC校验
+ */
+static int HexCrcOkAt(int i, int Len)
+{
+    return (HexCrc16(&G_RxBuf[i], (unsigned short)(Len - 2)) ==
+            (uint16_t)(G_RxBuf[i + Len - 2] | ((uint16_t)G_RxBuf[i + Len - 1] << 8)));
+}
+
+/**
+ * @brief 滑窗消费前n字节(压缩缓冲)
+ */
+static void HexDropPrefix(int n)
+{
+    memmove(G_RxBuf, &G_RxBuf[n], (size_t)(G_RxLen - n));
+
+    G_RxLen -= n;
+}
+
+/**
+ * @brief 滑窗位置i的帧头匹配检查(AA 55 + 目标CMD/ID)
+ *
+ * @return 1=匹配 0=非目标帧滑过 -1=帧头字段未收全需等待
+ */
+static int HexHeadMatch(int i, unsigned char Cmd, unsigned char Id)
+{
+    if ((G_RxBuf[i] != 0xAA) || (G_RxBuf[i + 1] != 0x55))
+    {
+        return 0; /* 非帧头, 滑过 */
+    }
+
+    if ((i + 6) > G_RxLen)
+    {
+        return -1; /* 帧头字段未收全, 等后续字节 */
+    }
+
+    if ((HEX_FR_CMD(&G_RxBuf[i]) != Cmd) || (HEX_FR_ID(&G_RxBuf[i]) != Id))
+    {
+        return 0; /* 非本用例应答(推送报文等), 滑过 */
+    }
+
+    return 1;
+}
+
+/**
+ * @brief 帧长字段检查(帧头字段已收全)
+ *
+ * @return 1=合法(*pLen=整帧长) 0=非法长度滑过 -1=帧未收全需等待
+ */
+static int HexLenOk(int i, int *pLen)
+{
+    int Len = HEX_FR_LEN(&G_RxBuf[i]);
+
+    if ((Len < 8) || (Len > HEX_FRAME_MAX))
+    {
+        return 0; /* 非法长度, 滑过 */
+    }
+
+    if ((i + Len) > G_RxLen)
+    {
+        return -1; /* 帧未收全, 等后续字节 */
+    }
+
+    *pLen = Len;
+
+    return 1;
+}
+
+/**
+ * @brief 在滑窗位置i尝试识别一帧应答(帧头匹配+帧长+CRC+期望长度)
+ *
+ * @return 1=已提取整帧到pFrame(*pFrameLen=帧长) 0=非目标帧滑过1字节 -1=帧未收全需等待
+ */
+static int HexFrameAt(int i, unsigned char Cmd, unsigned char Id,
+                      int ExpectLen, unsigned char *pFrame, int *pFrameLen)
+{
+    int Len = 0;
+
+    int H = HexHeadMatch(i, Cmd, Id);
+
+    if (H <= 0)
+    {
+        return H;
+    }
+
+    H = HexLenOk(i, &Len);
+
+    if (H <= 0)
+    {
+        return H;
+    }
+
+    if ((HexCrcOkAt(i, Len) == 0) || ((ExpectLen > 0) && (Len != ExpectLen)))
+    {
+        return 0; /* CRC不符或同ID推送帧长度不符, 滑过继续找 */
+    }
+
+    memcpy(pFrame, &G_RxBuf[i], (size_t)Len);
+
+    *pFrameLen = Len;
+
+    return 1;
 }
 
 /**
@@ -483,71 +587,59 @@ static int TryExtractFrame(unsigned char Cmd, unsigned char Id, int ExpectLen,
 
     while ((i + 2) <= G_RxLen)
     {
-        if ((G_RxBuf[i] != 0xAA) || (G_RxBuf[i + 1] != 0x55))
-        {
-            i++;
+        int FrameLen = 0;
+        int R = HexFrameAt(i, Cmd, Id, ExpectLen, pFrame, &FrameLen);
 
-            continue;
+        if (R < 0)
+        {
+            break; /* 帧未收全, 等后续字节 */
         }
 
-        if ((i + 6) > G_RxLen)
+        if (R > 0)
         {
-            break; /* 帧头未收全, 等后续字节 */
+            HexDropPrefix(i + FrameLen);
+
+            return FrameLen;
         }
 
-        if ((G_RxBuf[i + 2] != Cmd) || (G_RxBuf[i + 3] != Id))
-        {
-            i++; /* 非本用例应答(推送报文等), 滑过 */
-
-            continue;
-        }
-
-        {
-            int Len = G_RxBuf[i + 4] | ((int)G_RxBuf[i + 5] << 8);
-
-            if ((Len < 8) || (Len > HEX_FRAME_MAX))
-            {
-                i++; /* 非法长度, 滑过 */
-
-                continue;
-            }
-
-            if ((i + Len) > G_RxLen)
-            {
-                break; /* 帧未收全 */
-            }
-
-            if (HexCrc16(&G_RxBuf[i], (unsigned short)(Len - 2)) ==
-                (uint16_t)(G_RxBuf[i + Len - 2] | ((uint16_t)G_RxBuf[i + Len - 1] << 8)))
-            {
-                if ((ExpectLen > 0) && (Len != ExpectLen))
-                {
-                    i++; /* 同ID推送帧(如0x0022数据包4): CRC通过但长度不符, 滑过继续找 */
-
-                    continue;
-                }
-
-                memcpy(pFrame, &G_RxBuf[i], (size_t)Len);
-
-                memmove(G_RxBuf, &G_RxBuf[i + Len], (size_t)(G_RxLen - i - Len));
-
-                G_RxLen -= i + Len;
-
-                return Len;
-            }
-        }
-
-        i++; /* CRC不符, 滑过继续搜 */
+        i++;
     }
 
     if (i > 0)
     {
-        memmove(G_RxBuf, &G_RxBuf[i], (size_t)(G_RxLen - i));
-
-        G_RxLen -= i;
+        HexDropPrefix(i);
     }
 
     return 0;
+}
+
+/**
+ * @brief 收一批原始字节追加进滑窗缓冲(满则丢最旧)
+ */
+static void HexPumpBytes(DrvSerial_S *pDrv)
+{
+    unsigned char Buf[256];
+
+    int n = DrvSerialRecv(pDrv, Buf, (int)sizeof(Buf));
+
+    int i;
+
+    if (n <= 0)
+    {
+        return;
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        if (G_RxLen >= (int)sizeof(G_RxBuf))
+        {
+            memmove(G_RxBuf, &G_RxBuf[1], (size_t)(G_RxLen - 1));
+
+            G_RxLen--;
+        }
+
+        G_RxBuf[G_RxLen++] = Buf[i];
+    }
 }
 
 /**
@@ -561,46 +653,23 @@ static int TryExtractFrame(unsigned char Cmd, unsigned char Id, int ExpectLen,
 static int HexRecvFrame(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id,
                         int ExpectLen, int SkipLen, unsigned char *pFrame, double TimeoutMs)
 {
-    unsigned char Buf[256];
-
     double Start = NowMs();
 
     while (G_Running && ((NowMs() - Start) < TimeoutMs))
     {
-        int n = DrvSerialRecv(pDrv, Buf, (int)sizeof(Buf));
-
-        int i;
-
         int Got;
 
-        if (n < 0)
-        {
-            continue; /* 被信号打断: 回循环查G_Running */
-        }
-
-        for (i = 0; i < n; i++)
-        {
-            if (G_RxLen < (int)sizeof(G_RxBuf))
-            {
-                G_RxBuf[G_RxLen++] = Buf[i];
-            }
-            else
-            {
-                memmove(G_RxBuf, &G_RxBuf[1], (size_t)(G_RxLen - 1)); /* 防溢出丢最旧 */
-
-                G_RxBuf[G_RxLen - 1] = Buf[i];
-            }
-        }
+        HexPumpBytes(pDrv);
 
         Got = TryExtractFrame(Cmd, Id, ExpectLen, pFrame);
 
+        if ((Got > 0) && (SkipLen > 0) && (Got == SkipLen))
+        {
+            continue; /* 同ID推送帧(如数据包4): 已消费丢弃, 继续等应答 */
+        }
+
         if (Got > 0)
         {
-            if ((SkipLen > 0) && (Got == SkipLen))
-            {
-                continue; /* 同ID推送帧(如数据包4): 已消费丢弃, 继续等应答 */
-            }
-
             return Got;
         }
     }
@@ -638,6 +707,10 @@ static int HexTransact(DrvSerial_S *pDrv, unsigned char Cmd, unsigned char Id, u
     return HexRecvFrame(pDrv, Cmd, Id, ExpectLen, SkipLen, pFrame, HEX_RESP_TIMEOUT_MS);
 }
 
+/*===========================================================
+=                       值域辅助
+===========================================================*/
+
 /**
  * @brief 坐标系值是否在文档合法表内
  */
@@ -656,7 +729,10 @@ static int CoordInList(int v)
     return 0;
 }
 
-static int BaudInList(unsigned int v, const unsigned int *pList, unsigned int Num)
+/**
+ * @brief 无符号值是否在档位表内(波特率/量程共用)
+ */
+static int UIntInList(unsigned int v, const unsigned int *pList, unsigned int Num)
 {
     unsigned int i;
 
@@ -672,330 +748,491 @@ static int BaudInList(unsigned int v, const unsigned int *pList, unsigned int Nu
 }
 
 /**
- * @brief 查询应答按文档格式校验并提取关键值(同时更新风险组用查询缓存)
+ * @brief 帧内小端读u16
+ */
+static unsigned int GetU16(const unsigned char *p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+}
+
+/**
+ * @brief 帧内小端读u32
+ */
+static unsigned int GetU32(const unsigned char *p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+           ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+/*===========================================================
+=               查询应答校验(每校验键一个小函数+分发表)
+===========================================================*/
+
+/**
+ * @brief 应答数据不足时的统一报错
+ */
+static int NeedMore(char *pNote, int NoteSize, int Need)
+{
+    snprintf(pNote, (size_t)NoteSize, "应答数据不足(需%d字节)", Need);
+
+    return 0;
+}
+
+/** @brief 版本: APP4+硬件4(值按大端序展示, 与固件打包顺序一致) */
+static int CkVer(const char *Key, const unsigned char *pD, int DataN,
+                 char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    unsigned int App, Hw;
+
+    (void)Key;
+
+    if (DataN < 8)
+    {
+        return NeedMore(pNote, NoteSize, 8);
+    }
+
+    App = GetU32(pD);
+
+    Hw = GetU32(&pD[4]);
+
+    snprintf(pVals, (size_t)ValsSize, "APP:%u.%u.%u.%u 硬件:%u.%u.%u.%u",
+             (App >> 24) & 0xFF, (App >> 16) & 0xFF, (App >> 8) & 0xFF, App & 0xFF,
+             (Hw >> 24) & 0xFF, (Hw >> 16) & 0xFF, (Hw >> 8) & 0xFF, Hw & 0xFF);
+
+    return 1;
+}
+
+/** @brief 频率: 档位0x01~0x09, 同步查询缓存 */
+static int CkFreq(const char *Key, const unsigned char *pD, int DataN,
+                  char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    int v;
+
+    (void)Key;
+
+    if (DataN < 1)
+    {
+        return NeedMore(pNote, NoteSize, 1);
+    }
+
+    v = pD[0];
+
+    if ((v < 1) || (v > 9))
+    {
+        snprintf(pNote, (size_t)NoteSize, "频率档0x%02X超出文档范围(0x01~0x09)", pD[0]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "频率:%uHz", FreqHzList[v - 1]);
+
+    G_Cache.Freq = v;
+
+    G_Cache.FreqOk = 1;
+
+    return 1;
+}
+
+/** @brief 算法模式: 非零(固件实际支持1~5), 同步查询缓存 */
+static int CkMode(const char *Key, const unsigned char *pD, int DataN,
+                  char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    (void)Key;
+
+    if (DataN < 1)
+    {
+        return NeedMore(pNote, NoteSize, 1);
+    }
+
+    if (pD[0] == 0)
+    {
+        snprintf(pNote, (size_t)NoteSize, "算法模式为0(无效)");
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "算法模式:%d", pD[0]);
+
+    G_Cache.Mode = pD[0];
+
+    G_Cache.ModeOk = 1;
+
+    return 1;
+}
+
+/** @brief 推送状态: 0/1, 同步查询缓存 */
+static int CkPush(const char *Key, const unsigned char *pD, int DataN,
+                  char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    (void)Key;
+
+    if (DataN < 1)
+    {
+        return NeedMore(pNote, NoteSize, 1);
+    }
+
+    if (pD[0] > 1)
+    {
+        snprintf(pNote, (size_t)NoteSize, "推送状态0x%02X非0/1", pD[0]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "推送:%s", pD[0] ? "开" : "关");
+
+    G_Cache.Push = pD[0];
+
+    G_Cache.PushOk = 1;
+
+    return 1;
+}
+
+/** @brief PPS: 开关0/1+模式, 同步查询缓存 */
+static int CkPps(const char *Key, const unsigned char *pD, int DataN,
+                 char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    (void)Key;
+
+    if (DataN < 2)
+    {
+        return NeedMore(pNote, NoteSize, 2);
+    }
+
+    if (pD[0] > 1)
+    {
+        snprintf(pNote, (size_t)NoteSize, "PPS开关0x%02X非0/1", pD[0]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "PPS:%s 模式:%d", pD[0] ? "开" : "关", pD[1]);
+
+    G_Cache.PpsOn = pD[0];
+
+    G_Cache.PpsMode = pD[1];
+
+    G_Cache.PpsOk = 1;
+
+    return 1;
+}
+
+/** @brief 坐标系: 24值白名单, 同步查询缓存 */
+static int CkCoord(const char *Key, const unsigned char *pD, int DataN,
+                   char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    int v;
+
+    (void)Key;
+
+    if (DataN < 2)
+    {
+        return NeedMore(pNote, NoteSize, 2);
+    }
+
+    v = (int)GetU16(pD);
+
+    if (CoordInList(v) == 0)
+    {
+        snprintf(pNote, (size_t)NoteSize, "坐标系%d不在文档24值表内", v);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "坐标系:%d", v);
+
+    G_Cache.Coord = v;
+
+    G_Cache.CoordOk = 1;
+
+    return 1;
+}
+
+/** @brief 按串口/CAN选择波特率档位表, 返回元素个数 */
+static unsigned int PickBaudList(int IsCan, const unsigned int **ppList)
+{
+    if (IsCan != 0)
+    {
+        *ppList = CanBaudList;
+
+        return (unsigned int)(sizeof(CanBaudList) / sizeof(CanBaudList[0]));
+    }
+
+    *ppList = BaudList;
+
+    return (unsigned int)(sizeof(BaudList) / sizeof(BaudList[0]));
+}
+
+/** @brief 波特率: 7值白名单(串口/CAN共用, 单位由键决定) */
+static int CkBaud(const char *Key, const unsigned char *pD, int DataN,
+                  char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    const unsigned int *pList;
+    unsigned int Num;
+    unsigned int v;
+
+    int IsCan = (strcmp(Key, "canbaud") == 0);
+
+    if (DataN < 4)
+    {
+        return NeedMore(pNote, NoteSize, 4);
+    }
+
+    v = GetU32(pD);
+
+    Num = PickBaudList(IsCan, &pList);
+
+    if (UIntInList(v, pList, Num) == 0)
+    {
+        snprintf(pNote, (size_t)NoteSize, "%s波特率%u不在文档%u值表内",
+                 IsCan ? "CAN" : "串口", v, Num);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "%s波特率:%u%s",
+             IsCan ? "CAN" : "", v, IsCan ? "K" : "");
+
+    return 1;
+}
+
+/** @brief SN: 16字节可打印化展示 */
+static int CkSn(const char *Key, const unsigned char *pD, int DataN,
+                char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    char Sn[20];
+
+    int i;
+
+    (void)Key;
+
+    if (DataN < 16)
+    {
+        return NeedMore(pNote, NoteSize, 16);
+    }
+
+    for (i = 0; i < 16; i++)
+    {
+        Sn[i] = ((pD[i] >= 0x20) && (pD[i] < 0x7F)) ? (char)pD[i] : '.';
+    }
+
+    Sn[16] = '\0';
+
+    snprintf(pVals, (size_t)ValsSize, "SN:%s", Sn);
+
+    return 1;
+}
+
+/** @brief 量程: accscale/gyroscale共用, 档位白名单(3.2.3.17) */
+static int CkScale(const char *Key, const unsigned char *pD, int DataN,
+                   char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    static const unsigned int AccList[]  = { 2, 4, 8, 16 };
+
+    static const unsigned int GyroList[] = { 250, 500, 1000, 2000 };
+
+    int IsAcc = (Key[0] == 'a');
+
+    unsigned int v;
+
+    if (DataN < 2)
+    {
+        return NeedMore(pNote, NoteSize, 2);
+    }
+
+    v = GetU16(pD);
+
+    if (UIntInList(v, IsAcc ? AccList : GyroList, 4) == 0)
+    {
+        snprintf(pNote, (size_t)NoteSize, "量程%u不在档位表", v);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "%s量程:%u%s",
+             IsAcc ? "加速度" : "角速度", v, IsAcc ? "g" : "\xC2\xB0/s");
+
+    return 1;
+}
+
+/** @brief 单字节值展示: A值/电量共用 */
+static int CkByte(const char *Key, const unsigned char *pD, int DataN,
+                  char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    int IsBatt = (strcmp(Key, "batt") == 0);
+
+    if (DataN < 1)
+    {
+        return NeedMore(pNote, NoteSize, 1);
+    }
+
+    snprintf(pVals, (size_t)ValsSize, IsBatt ? "电量:%d%%" : "A值:%d", pD[0]);
+
+    return 1;
+}
+
+/** @brief 校验键->校验函数分发表 */
+typedef int (*HxCheck_Fn)(const char *Key, const unsigned char *pD, int DataN,
+                          char *pVals, int ValsSize, char *pNote, int NoteSize);
+
+static const struct
+{
+    const char *Key;
+
+    HxCheck_Fn Fn;
+} G_CheckMap[] =
+{
+    { "ver",      CkVer    },
+    { "freq",     CkFreq   },
+    { "mode",     CkMode   },
+    { "push",     CkPush   },
+    { "pps",      CkPps    },
+    { "coord",    CkCoord  },
+    { "baud",     CkBaud   },
+    { "canbaud",  CkBaud   },
+    { "sn",       CkSn     },
+    { "aval",     CkByte   },
+    { "batt",     CkByte   },
+    { "accscale", CkScale  },
+    { "gyroscale", CkScale },
+};
+
+/**
+ * @brief 查询应答按文档格式校验并提取关键值(分发表分发到各校验键函数)
  *
  * @return 1=通过 0=不通过(Note给出原因)
  */
 static int CheckQuery(const HxCase_S *pC, const unsigned char *pFrame, int FrameLen,
                       char *pVals, int ValsSize, char *pNote, int NoteSize)
 {
-    const unsigned char *pD = HEX_RESP_DATA(pFrame); /* 应答DATA起始 */
+    unsigned int i;
 
-    int DataN = HEX_RESP_DATALEN(pFrame);            /* 应答DATA长度 */
+    (void)FrameLen;
 
-    if (strcmp(pC->Expect, "ver") == 0)
+    for (i = 0; i < sizeof(G_CheckMap) / sizeof(G_CheckMap[0]); i++)
     {
-        uint32_t App, Hw;
-
-        if (DataN < 8)
+        if (strcmp(pC->Expect, G_CheckMap[i].Key) == 0)
         {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需8)", DataN);
-
-            return 0;
+            return G_CheckMap[i].Fn(pC->Expect, HEX_RESP_DATA(pFrame),
+                                    HEX_RESP_DATALEN(pFrame), pVals, ValsSize, pNote, NoteSize);
         }
-
-        App = (uint32_t)pD[0] | ((uint32_t)pD[1] << 8) | ((uint32_t)pD[2] << 16) | ((uint32_t)pD[3] << 24);
-
-        Hw = (uint32_t)pD[4] | ((uint32_t)pD[5] << 8) | ((uint32_t)pD[6] << 16) | ((uint32_t)pD[7] << 24);
-
-        snprintf(pVals, (size_t)ValsSize, "APP:%u.%u.%u.%u 硬件:%u.%u.%u.%u",
-                 (App >> 24) & 0xFF, (App >> 16) & 0xFF, (App >> 8) & 0xFF, App & 0xFF,
-                 (Hw >> 24) & 0xFF, (Hw >> 16) & 0xFF, (Hw >> 8) & 0xFF, Hw & 0xFF);
     }
-    else if (strcmp(pC->Expect, "freq") == 0)
-    {
-        int v;
 
-        if (DataN < 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需1)", DataN);
+    pVals[0] = '\0'; /* 无值域要求: 帧CRC通过即可 */
 
-            return 0;
-        }
+    return 1;
+}
 
-        v = pD[0];
+/*===========================================================
+=               风险组发送数据构造(每类型一个小函数)
+===========================================================*/
 
-        if ((v < 1) || (v > 9))
-        {
-            snprintf(pNote, (size_t)NoteSize, "频率档0x%02X超出文档范围(0x01~0x09)", pD[0]);
+/** @brief 构造频率设置DATA: 10Hz(撞档则20Hz) */
+static int MakeFreqData(unsigned char *pData, unsigned char *pDataLen)
+{
+    if (G_Cache.FreqOk == 0) { return 0; }
 
-            return 0;
-        }
+    pData[0] = (unsigned char)((G_Cache.Freq != 3) ? 3 : 4);
 
-        snprintf(pVals, (size_t)ValsSize, "频率:%uHz", FreqHzList[v - 1]);
+    *pDataLen = 1;
 
-        G_Cache.Freq = v;
+    return 1;
+}
 
-        G_Cache.FreqOk = 1;
-    }
-    else if (strcmp(pC->Expect, "mode") == 0)
-    {
-        int v;
+/** @brief 构造算法模式设置DATA: 6轴DMP(撞档则9轴DMP) */
+static int MakeModeData(unsigned char *pData, unsigned char *pDataLen)
+{
+    if (G_Cache.ModeOk == 0) { return 0; }
 
-        if (DataN < 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需1)", DataN);
+    pData[0] = (unsigned char)((G_Cache.Mode != 1) ? 1 : 2);
 
-            return 0;
-        }
+    *pDataLen = 1;
 
-        v = pD[0];
+    return 1;
+}
 
-        if (v == 0)
-        {
-            snprintf(pNote, (size_t)NoteSize, "算法模式为0(无效)");
+/** @brief 构造推送开关取反DATA */
+static int MakePushInvData(unsigned char *pData, unsigned char *pDataLen)
+{
+    if (G_Cache.PushOk == 0) { return 0; }
 
-            return 0;
-        }
+    pData[0] = (unsigned char)(G_Cache.Push ? 0x00 : 0x01);
 
-        snprintf(pVals, (size_t)ValsSize, "算法模式:%d", v);
+    *pDataLen = 1;
 
-        G_Cache.Mode = v;
+    return 1;
+}
 
-        G_Cache.ModeOk = 1;
-    }
-    else if (strcmp(pC->Expect, "push") == 0)
-    {
-        int v;
+/** @brief 构造PPS取反DATA: 开关取反+模式保持 */
+static int MakePpsInvData(unsigned char *pData, unsigned char *pDataLen)
+{
+    if (G_Cache.PpsOk == 0) { return 0; }
 
-        if (DataN < 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需1)", DataN);
+    pData[0] = (unsigned char)(G_Cache.PpsOn ? 0x00 : 0x01);
 
-            return 0;
-        }
+    pData[1] = (unsigned char)G_Cache.PpsMode;
 
-        v = pD[0];
+    memset(&pData[2], 0, 8);
 
-        if (v > 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "推送状态0x%02X非0/1", pD[0]);
+    *pDataLen = 10;
 
-            return 0;
-        }
+    return 1;
+}
 
-        snprintf(pVals, (size_t)ValsSize, "推送:%s", v ? "开" : "关");
+/** @brief 构造坐标系切换DATA: 切到异于原值(200, 撞档则100) */
+static int MakeCoordAltData(unsigned char *pData, unsigned char *pDataLen)
+{
+    int Alt;
 
-        G_Cache.Push = v;
+    if (G_Cache.CoordOk == 0) { return 0; }
 
-        G_Cache.PushOk = 1;
-    }
-    else if (strcmp(pC->Expect, "pps") == 0)
-    {
-        int On, Mode;
+    Alt = (G_Cache.Coord != 200) ? 200 : 100;
 
-        if (DataN < 2)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需2)", DataN);
+    pData[0] = (unsigned char)(Alt & 0xFF);
 
-            return 0;
-        }
+    pData[1] = (unsigned char)((Alt >> 8) & 0xFF);
 
-        On = pD[0];
+    memset(&pData[2], 0, 8);
 
-        Mode = pD[1];
+    *pDataLen = 10;
 
-        if (On > 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "PPS开关0x%02X非0/1", pD[0]);
+    return 1;
+}
 
-            return 0;
-        }
+/** @brief 构造时间同步DATA: 主机当前时间(年2+月日时分秒5+预留8) */
+static int MakeTimeNowData(unsigned char *pData, unsigned char *pDataLen)
+{
+    struct tm Tm;
 
-        snprintf(pVals, (size_t)ValsSize, "PPS:%s 模式:%d", On ? "开" : "关", Mode);
+    time_t Now = time(NULL);
 
-        G_Cache.PpsOn = On;
+    int Year;
 
-        G_Cache.PpsMode = Mode;
+    localtime_r(&Now, &Tm);
+    Year = Tm.tm_year + 1900;
 
-        G_Cache.PpsOk = 1;
-    }
-    else if (strcmp(pC->Expect, "coord") == 0)
-    {
-        int v;
+    pData[0] = (unsigned char)(Year & 0xFF);
 
-        if (DataN < 2)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需2)", DataN);
+    pData[1] = (unsigned char)((Year >> 8) & 0xFF);
 
-            return 0;
-        }
+    pData[2] = (unsigned char)(Tm.tm_mon + 1);
 
-        v = pD[0] | ((int)pD[1] << 8);
+    pData[3] = (unsigned char)Tm.tm_mday;
 
-        if (CoordInList(v) == 0)
-        {
-            snprintf(pNote, (size_t)NoteSize, "坐标系%d不在文档24值表内", v);
+    pData[4] = (unsigned char)Tm.tm_hour;
 
-            return 0;
-        }
+    pData[5] = (unsigned char)Tm.tm_min;
 
-        snprintf(pVals, (size_t)ValsSize, "坐标系:%d", v);
+    pData[6] = (unsigned char)Tm.tm_sec;
 
-        G_Cache.Coord = v;
+    memset(&pData[7], 0, 8);
 
-        G_Cache.CoordOk = 1;
-    }
-    else if (strcmp(pC->Expect, "baud") == 0)
-    {
-        uint32_t v;
-
-        if (DataN < 4)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需4)", DataN);
-
-            return 0;
-        }
-
-        v = (uint32_t)pD[0] | ((uint32_t)pD[1] << 8) | ((uint32_t)pD[2] << 16) | ((uint32_t)pD[3] << 24);
-
-        if (BaudInList(v, BaudList, sizeof(BaudList) / sizeof(BaudList[0])) == 0)
-        {
-            snprintf(pNote, (size_t)NoteSize, "波特率%u不在文档7值表内", v);
-
-            return 0;
-        }
-
-        snprintf(pVals, (size_t)ValsSize, "波特率:%u", v);
-    }
-    else if (strcmp(pC->Expect, "canbaud") == 0)
-    {
-        uint32_t v;
-
-        if (DataN < 4)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需4)", DataN);
-
-            return 0;
-        }
-
-        v = (uint32_t)pD[0] | ((uint32_t)pD[1] << 8) | ((uint32_t)pD[2] << 16) | ((uint32_t)pD[3] << 24);
-
-        if (BaudInList(v, CanBaudList, sizeof(CanBaudList) / sizeof(CanBaudList[0])) == 0)
-        {
-            snprintf(pNote, (size_t)NoteSize, "CAN波特率%u不在文档3值表内", v);
-
-            return 0;
-        }
-
-        snprintf(pVals, (size_t)ValsSize, "CAN波特率:%uK", v);
-    }
-    else if (strcmp(pC->Expect, "sn") == 0)
-    {
-        char Sn[20];
-
-        int i;
-
-        if (DataN < 16)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需16)", DataN);
-
-            return 0;
-        }
-
-        for (i = 0; i < 16; i++)
-        {
-            unsigned char c = pD[i];
-
-            Sn[i] = ((c >= 0x20) && (c < 0x7F)) ? (char)c : '.';
-        }
-
-        Sn[16] = '\0';
-
-        snprintf(pVals, (size_t)ValsSize, "SN:%s", Sn);
-    }
-    else if (strcmp(pC->Expect, "aval") == 0)
-    {
-        if (DataN < 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需1)", DataN);
-
-            return 0;
-        }
-
-        snprintf(pVals, (size_t)ValsSize, "A值:%d", pD[0]);
-    }
-    else if (strcmp(pC->Expect, "batt") == 0)
-    {
-        if (DataN < 1)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需1)", DataN);
-
-            return 0;
-        }
-
-        snprintf(pVals, (size_t)ValsSize, "电量:%d%%", pD[0]);
-    }
-    else if ((strcmp(pC->Expect, "accscale") == 0) || (strcmp(pC->Expect, "gyroscale") == 0))
-    {
-        /* 3.2.3.17: 应答DATA=量程值2(小端)+预留8, 值域档位白名单 */
-        static const unsigned short AccScaleList[]  = { 2, 4, 8, 16 };
-
-        static const unsigned short GyroScaleList[] = { 250, 500, 1000, 2000 };
-
-        const unsigned short *pList;
-
-        unsigned int ListNum;
-
-        unsigned int k;
-
-        int Hit = 0;
-
-        unsigned int v;
-
-        if (DataN < 2)
-        {
-            snprintf(pNote, (size_t)NoteSize, "应答数据不足(%d字节, 需2)", DataN);
-
-            return 0;
-        }
-
-        if (pC->Expect[0] == 'a')
-        {
-            pList = AccScaleList;
-
-            ListNum = sizeof(AccScaleList) / sizeof(AccScaleList[0]);
-        }
-        else
-        {
-            pList = GyroScaleList;
-
-            ListNum = sizeof(GyroScaleList) / sizeof(GyroScaleList[0]);
-        }
-
-        v = (unsigned int)pD[0] | ((unsigned int)pD[1] << 8);
-
-        for (k = 0; k < ListNum; k++)
-        {
-            if (pList[k] == v)
-            {
-                Hit = 1;
-
-                break;
-            }
-        }
-
-        if (Hit == 0)
-        {
-            snprintf(pNote, (size_t)NoteSize, "量程%u不在档位表", v);
-
-            return 0;
-        }
-
-        snprintf(pVals, (size_t)ValsSize, "%s量程:%u%s",
-                 (pC->Expect[0] == 'a') ? "加速度" : "角速度", v,
-                 (pC->Expect[0] == 'a') ? "g" : "\xC2\xB0/s");
-    }
-    else
-    {
-        pVals[0] = '\0'; /* 无值域要求: 帧CRC通过即可 */
-    }
+    *pDataLen = 15;
 
     return 1;
 }
 
 /**
- * @brief 风险用例发送数据的动态构造
+ * @brief 风险用例发送数据的动态构造(按SetKind分发)
  *
  * @return 1=成功 0=依赖的查询缓存无效(应跳过)
  */
@@ -1003,97 +1240,180 @@ static int BuildSetData(const HxCase_S *pC, unsigned char *pData, unsigned char 
 {
     switch (pC->SetKind)
     {
-        case HX_S_FREQ:
-            if (G_Cache.FreqOk == 0) { return 0; }
+        case HX_S_FREQ:      return MakeFreqData(pData, pDataLen);
 
-            pData[0] = (unsigned char)((G_Cache.Freq != 3) ? 3 : 4); /* 10Hz, 撞档则20Hz */
+        case HX_S_MODE:      return MakeModeData(pData, pDataLen);
 
-            *pDataLen = 1;
+        case HX_S_PUSH_INV:  return MakePushInvData(pData, pDataLen);
 
-            break;
+        case HX_S_PPS_INV:   return MakePpsInvData(pData, pDataLen);
 
-        case HX_S_MODE:
-            if (G_Cache.ModeOk == 0) { return 0; }
+        case HX_S_COORD_ALT: return MakeCoordAltData(pData, pDataLen);
 
-            pData[0] = (unsigned char)((G_Cache.Mode != 1) ? 1 : 2); /* 6轴DMP, 撞档则9轴DMP */
-
-            *pDataLen = 1;
-
-            break;
-
-        case HX_S_PUSH_INV:
-            if (G_Cache.PushOk == 0) { return 0; }
-
-            pData[0] = (unsigned char)(G_Cache.Push ? 0x00 : 0x01);
-
-            *pDataLen = 1;
-
-            break;
-
-        case HX_S_PPS_INV:
-            if (G_Cache.PpsOk == 0) { return 0; }
-
-            pData[0] = (unsigned char)(G_Cache.PpsOn ? 0x00 : 0x01);
-
-            pData[1] = (unsigned char)G_Cache.PpsMode;
-
-            memset(&pData[2], 0, 8);
-
-            *pDataLen = 10;
-
-            break;
-
-        case HX_S_COORD_ALT:
-            if (G_Cache.CoordOk == 0) { return 0; }
-
-            pData[0] = (unsigned char)(((G_Cache.Coord != 200) ? 200 : 100) & 0xFF);
-
-            pData[1] = (unsigned char)(((G_Cache.Coord != 200) ? 200 : 100) >> 8);
-
-            memset(&pData[2], 0, 8);
-
-            *pDataLen = 10;
-
-            break;
-
-        case HX_S_TIME_NOW:
-            {
-                struct tm Tm;
-
-                time_t Now = time(NULL);
-
-                localtime_r(&Now, &Tm);
-
-                pData[0] = (unsigned char)((Tm.tm_year + 1900) & 0xFF);
-
-                pData[1] = (unsigned char)(((Tm.tm_year + 1900) >> 8) & 0xFF);
-
-                pData[2] = (unsigned char)(Tm.tm_mon + 1);
-
-                pData[3] = (unsigned char)Tm.tm_mday;
-
-                pData[4] = (unsigned char)Tm.tm_hour;
-
-                pData[5] = (unsigned char)Tm.tm_min;
-
-                pData[6] = (unsigned char)Tm.tm_sec;
-
-                memset(&pData[7], 0, 8);
-
-                *pDataLen = 15; /* 年2+月日时分秒5+预留8 */
-            }
-
-            break;
+        case HX_S_TIME_NOW:  return MakeTimeNowData(pData, pDataLen);
 
         default: /* HX_S_FIXED */
             memcpy(pData, pC->Data, pC->DataLen);
 
             *pDataLen = pC->DataLen;
 
+            return 1;
+    }
+}
+
+/*===========================================================
+=               风险组还原(构造+发送判定分离)
+===========================================================*/
+
+/** @brief 单字节类还原(频率/模式/推送): 取缓存值, 返回缓存有效标志(-1=非本类) */
+static int CacheByte(HxRestoreKind_E Kind, unsigned char *pVal)
+{
+    switch (Kind)
+    {
+        case HX_R_FREQ: *pVal = (unsigned char)G_Cache.Freq; return G_Cache.FreqOk;
+        case HX_R_MODE: *pVal = (unsigned char)G_Cache.Mode; return G_Cache.ModeOk;
+        case HX_R_PUSH: *pVal = (unsigned char)G_Cache.Push; return G_Cache.PushOk;
+        default: return -1;
+    }
+}
+
+/**
+ * @brief 构造还原DATA(按Restore方式)
+ *
+ * @return 1=成功 -1=依赖的查询缓存无效
+ */
+static int HexRestoreData(HxRestoreKind_E Kind, unsigned char *pData, unsigned char *pDataLen)
+{
+    unsigned char Val;
+
+    int Ok = CacheByte(Kind, &Val);
+
+    if (Ok < 0)
+    {
+        return -1; /* 其余方式由 HexRestoreData2 处理 */
+    }
+
+    pData[0] = Val;
+
+    *pDataLen = 1;
+
+    return Ok;
+}
+
+/** @brief PPS还原DATA: 缓存的开关+模式+预留8 */
+static int RestorePpsData(unsigned char *pData, unsigned char *pDataLen)
+{
+    if (G_Cache.PpsOk == 0) { return -1; }
+
+    pData[0] = (unsigned char)G_Cache.PpsOn;
+
+    pData[1] = (unsigned char)G_Cache.PpsMode;
+
+    memset(&pData[2], 0, 8);
+
+    *pDataLen = 10;
+
+    return 1;
+}
+
+/** @brief 坐标系还原DATA: 缓存的坐标系(小端2)+预留8 */
+static int RestoreCoordData(unsigned char *pData, unsigned char *pDataLen)
+{
+    if (G_Cache.CoordOk == 0) { return -1; }
+
+    pData[0] = (unsigned char)(G_Cache.Coord & 0xFF);
+
+    pData[1] = (unsigned char)((G_Cache.Coord >> 8) & 0xFF);
+
+    memset(&pData[2], 0, 8);
+
+    *pDataLen = 10;
+
+    return 1;
+}
+
+/** @brief 关0x0022推送还原DATA: 报文ID+开关(3.2.3.6格式) */
+static int RestoreMsg22Data(unsigned char *pData, unsigned char *pDataLen)
+{
+    pData[0] = 0x00;
+
+    pData[1] = HEX_ID_L(HEX_ID_SCALE);
+
+    pData[2] = 0x00;
+
+    *pDataLen = 3;
+
+    return 1;
+}
+
+/**
+ * @brief 构造还原DATA续: PPS/坐标系/固定还原类
+ *
+ * @return 1=成功 -1=依赖的查询缓存无效
+ */
+static int HexRestoreData2(HxRestoreKind_E Kind, unsigned char *pData, unsigned char *pDataLen)
+{
+    switch (Kind)
+    {
+        case HX_R_PPS:       return RestorePpsData(pData, pDataLen);
+        case HX_R_COORD:     return RestoreCoordData(pData, pDataLen);
+        case HX_R_MSG22_OFF: return RestoreMsg22Data(pData, pDataLen);
+        default:             return -1; /* 其余方式由 HexRestoreData3 处理 */
+    }
+}
+
+/**
+ * @brief 构造还原DATA续: 磁力计/零偏固定还原类
+ *
+ * @return 1=成功
+ */
+static int HexRestoreData3(HxRestoreKind_E Kind, unsigned char *pData, unsigned char *pDataLen)
+{
+    switch (Kind)
+    {
+        case HX_R_MAG_OFF:
+            pData[0] = 0x00;
+
+            *pDataLen = 1;
+
             break;
+
+        case HX_R_ZERO_OFF:
+            pData[0] = 0x00;
+
+            memset(&pData[1], 0, 8);
+
+            *pDataLen = 9;
+
+            break;
+
+        default: /* HX_R_NONE 无需还原 */
+            return 1;
     }
 
     return 1;
+}
+
+/**
+ * @brief 构造还原DATA总入口(三级分发: 单字节缓存/PPS坐标系固定/磁力计零偏)
+ *
+ * @return 1=成功 -1=依赖的查询缓存无效
+ */
+static int BuildRestoreData(HxRestoreKind_E Kind, unsigned char *pData, unsigned char *pDataLen)
+{
+    int R = HexRestoreData(Kind, pData, pDataLen);
+
+    if (R < 0)
+    {
+        R = HexRestoreData2(Kind, pData, pDataLen);
+    }
+
+    if (R < 0)
+    {
+        R = HexRestoreData3(Kind, pData, pDataLen);
+    }
+
+    return R;
 }
 
 /**
@@ -1111,90 +1431,14 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
 
     int n;
 
-    switch (pC->Restore)
+    if (pC->Restore == HX_R_NONE)
     {
-        case HX_R_FREQ:
-            if (G_Cache.FreqOk == 0) { return -1; }
+        return 1;
+    }
 
-            Data[0] = (unsigned char)G_Cache.Freq;
-
-            DataLen = 1;
-
-            break;
-
-        case HX_R_MODE:
-            if (G_Cache.ModeOk == 0) { return -1; }
-
-            Data[0] = (unsigned char)G_Cache.Mode;
-
-            DataLen = 1;
-
-            break;
-
-        case HX_R_PUSH:
-            if (G_Cache.PushOk == 0) { return -1; }
-
-            Data[0] = (unsigned char)G_Cache.Push;
-
-            DataLen = 1;
-
-            break;
-
-        case HX_R_PPS:
-            if (G_Cache.PpsOk == 0) { return -1; }
-
-            Data[0] = (unsigned char)G_Cache.PpsOn;
-
-            Data[1] = (unsigned char)G_Cache.PpsMode;
-
-            memset(&Data[2], 0, 8);
-
-            DataLen = 10;
-
-            break;
-
-        case HX_R_COORD:
-            if (G_Cache.CoordOk == 0) { return -1; }
-
-            Data[0] = (unsigned char)(G_Cache.Coord & 0xFF);
-
-            Data[1] = (unsigned char)((G_Cache.Coord >> 8) & 0xFF);
-
-            memset(&Data[2], 0, 8);
-
-            DataLen = 10;
-
-            break;
-
-        case HX_R_MSG22_OFF:
-            Data[0] = 0x00;
-
-            Data[1] = 0x22;
-
-            Data[2] = 0x00;
-
-            DataLen = 3;
-
-            break;
-
-        case HX_R_MAG_OFF:
-            Data[0] = 0x00;
-
-            DataLen = 1;
-
-            break;
-
-        case HX_R_ZERO_OFF:
-            Data[0] = 0x00;
-
-            memset(&Data[1], 0, 8);
-
-            DataLen = 9;
-
-            break;
-
-        default: /* HX_R_NONE */
-            return 1;
+    if (BuildRestoreData(pC->Restore, Data, &DataLen) < 0)
+    {
+        return -1;
     }
 
     n = HexTransact(pDrv, pC->Cmd, pC->Id, HEX_OP_RAM, Data, DataLen, 0, 0, Frame);
@@ -1207,110 +1451,230 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
     return (HEX_RESP_DATA0(Frame) == 0x00) ? 1 : 0; /* 应答DATA[0]==0x00视为还原成功 */
 }
 
-/**
- * @brief 量程查询(0x0022): 文档3.2.3.17仅给"设置发送"表, 查询帧格式缺失,
- *        按候选格式自动探测, 收到应答即视为命中格式(结果中标注)
- *
- * @note  候选依据: 1)CAN侧0x115查询定义(类型+预留, 去值字段)
- *                 2)最简(仅类型1字节)
- *                 3)设置帧同构(类型1+值2填0+预留8, 此格式真机已验证无应答, 置末)
- */
-static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+/*===========================================================
+=               量程查询(0x22): 多格式探测+宽容诊断
+===========================================================*/
+
+/** @brief 量程查询候选格式表: 文档3.2.3.17无查询表, 按固件行为与CAN 0x115惯例探测 */
+static const struct
 {
-    static const struct
-    {
-        unsigned char DataLen;
+    unsigned char DataLen;
 
-        const char *Desc;
-    } Fmt[] =
-    {
-        { 9,  "类型+预留8" },   /* CAN 0x115查询映射 */
-        { 1,  "类型1" },        /* 最简 */
-        { 11, "设置帧同构" },   /* 3.2.3.17设置表结构 */
-    };
+    const char *Desc;
+} G_ScaleFmt[] =
+{
+    { 9,  "类型+预留8" },   /* CAN 0x115查询映射 */
+    { 1,  "类型1" },        /* 最简 */
+    { 11, "设置帧同构" },   /* 3.2.3.17设置表结构 */
+};
 
+/**
+ * @brief 应答校验通过后给Vals加前缀标注并置Pass(避免Vals被覆盖丢失)
+ */
+static void MarkVals(HxResult_S *pRes, const char *pFmt, ...)
+{
+    char Mark[HEX_VALS_MAX];
+
+    char Tmp[HEX_VALS_MAX];
+
+    va_list Args;
+
+    va_start(Args, pFmt);
+
+    vsnprintf(Mark, sizeof(Mark), pFmt, Args);
+
+    va_end(Args);
+
+    snprintf(Tmp, sizeof(Tmp), "%s %s", Mark, pRes->Vals);
+
+    snprintf(pRes->Vals, (int)sizeof(pRes->Vals), "%s", Tmp);
+
+    pRes->Pass = 1;
+}
+
+/**
+ * @brief 阶段1: 按候选格式探测(期望应答帧长18=文档回复表)
+ *
+ * @return 1=已收到应答(结果已写入pRes) 0=全部格式无应答(转阶段2)
+ */
+static int HexScaleProbe(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+{
     unsigned char Data[16];
 
     unsigned char Frame[HEX_FRAME_MAX];
 
     unsigned int f;
-
     int n;
 
-    /* 阶段1: 按候选格式探测(期望应答帧长18=文档回复表) */
-    for (f = 0; f < (sizeof(Fmt) / sizeof(Fmt[0])); f++)
+    for (f = 0; f < (sizeof(G_ScaleFmt) / sizeof(G_ScaleFmt[0])); f++)
     {
         memset(Data, 0, sizeof(Data));
 
-        Data[0] = pC->Data[0]; /* 量程类型: 0x01加速度 / 0x02角速度 */
-
-        n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, Fmt[f].DataLen,
+        Data[0] = pC->Data[0]; /* 量程类型: 0x01加速度/0x02角速度 */
+        n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, G_ScaleFmt[f].DataLen,
                         pC->ExpectLen, 46, Frame);
 
         if (n > 0)
         {
-            /* 收到应答: 该格式即固件接受的格式, 直接判定不再探测 */
             if (CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
                            pRes->Note, (int)sizeof(pRes->Note)) != 0)
             {
-                char Tmp[HEX_VALS_MAX];
-
-                snprintf(Tmp, sizeof(Tmp), "[查询格式:%s] %s", Fmt[f].Desc, pRes->Vals);
-
-                snprintf(pRes->Vals, (int)sizeof(pRes->Vals), "%s", Tmp);
-
-                pRes->Pass = 1;
+                MarkVals(pRes, "[查询格式:%s]", G_ScaleFmt[f].Desc);
             }
 
-            return;
+            return 1;
         }
     }
 
-    /* 阶段2诊断: 不限应答长度重试(跳过数据包4推送帧), 应答长度可能非文档18 */
-    memset(Data, 0, sizeof(Data));
+    return 0;
+}
 
-    Data[0] = pC->Data[0];
+/**
+ * @brief 帧hex格式化(诊断打印用)
+ */
+static void HexFmtHex(const unsigned char *pFrame, int n, char *pHex, int Size)
+{
+    int i;
 
-    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, Fmt[0].DataLen,
-                    0, 46, Frame);
+    int M = (n > 16) ? 16 : n;
 
-    if (n > 0)
+    (void)Size;
+
+    for (i = 0; i < M; i++)
     {
-        /* 宽容判定: 数据域>=2字节且量程值在档位表即通过 */
-        if (CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
-                       pRes->Note, (int)sizeof(pRes->Note)) != 0)
-        {
-            char Tmp[HEX_VALS_MAX];
+        snprintf(&pHex[i * 3], 4, "%02X ", pFrame[i]);
+    }
+}
 
-            snprintf(Tmp, sizeof(Tmp), "[宽容:应答Len=%d 格式:%s] %s",
-                     n, Fmt[0].Desc, pRes->Vals);
+/** @brief 阶段2收包: 类型+预留8格式, 不限应答长度(跳过数据包4推送帧) */
+static int ScaleDiagRecv(DrvSerial_S *pDrv, const HxCase_S *pC,
+                         unsigned char *pData, unsigned char *pFrame)
+{
+    memset(pData, 0, 16);
 
-            snprintf(pRes->Vals, (int)sizeof(pRes->Vals), "%s", Tmp);
+    *pData = pC->Data[0]; /* 量程类型 */
 
-            pRes->Pass = 1;
-        }
-        else
-        {
-            /* 收到帧但解析不出档位: 打印原始帧辅助定位 */
-            char Hex[64];
+    return HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, pData, G_ScaleFmt[0].DataLen,
+                       0, 46, pFrame);
+}
 
-            int i;
+/**
+ * @brief 阶段2诊断: 不限应答长度重试(跳过数据包4推送帧), 应答长度可能非文档18
+ */
+static void HexScaleDiag(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+{
+    unsigned char Data[16];
 
-            int M = (n > 16) ? 16 : n;
+    unsigned char Frame[HEX_FRAME_MAX];
 
-            for (i = 0; i < M; i++)
-            {
-                snprintf(&Hex[i * 3], 4, "%02X ", Frame[i]);
-            }
+    char Hex[64];
 
-            snprintf(pRes->Note, sizeof(pRes->Note), "应答Len=%d解析失败,帧:%.48s", n, Hex);
-        }
+    int n = ScaleDiagRecv(pDrv, pC, Data, Frame);
+
+    if (n <= 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note),
+                 "3格式+不限长诊断均无应答(固件串口0x22查询疑未实现)");
 
         return;
     }
 
+    if (CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
+                   pRes->Note, (int)sizeof(pRes->Note)) != 0)
+    {
+        MarkVals(pRes, "[宽容:应答Len=%d 格式:%s]", n, G_ScaleFmt[0].Desc);
+
+        return;
+    }
+
+    HexFmtHex(Frame, n, Hex, (int)sizeof(Hex));
+
     snprintf(pRes->Note, sizeof(pRes->Note),
-             "3格式+不限长诊断均无应答(固件串口0x22查询疑未实现)");
+             "应答Len=%d解析失败,帧:%.48s", n, Hex);
+}
+
+/**
+ * @brief 量程查询(0x0022): 阶段1多格式探测 -> 阶段2宽容诊断
+ */
+static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+{
+    if (HexScaleProbe(pDrv, pC, pRes) != 0)
+    {
+        return;
+    }
+
+    HexScaleDiag(pDrv, pC, pRes);
+}
+
+/*===========================================================
+=                       用例执行
+===========================================================*/
+
+/**
+ * @brief 查询/动作类应答判定(发送收包已完成)
+ *
+ * @return 1=通过(Vals已填) 0=失败(Note已填)
+ */
+static int HexCheckReply(const HxCase_S *pC, const unsigned char *pFrame, int n,
+                         char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    if (pC->Type == HX_T_QUERY)
+    {
+        return CheckQuery(pC, pFrame, n, pVals, ValsSize, pNote, NoteSize);
+    }
+
+    /* 动作类: 应答DATA[0]==0x00即过 */
+    if (HEX_RESP_DATALEN(pFrame) < 1)
+    {
+        snprintf(pNote, (size_t)NoteSize, "应答无DATA域");
+
+        return 0;
+    }
+
+    if (HEX_RESP_DATA0(pFrame) != 0x00)
+    {
+        snprintf(pNote, (size_t)NoteSize, "应答码0x%02X非0x00", HEX_RESP_DATA0(pFrame));
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "%s", pC->Name);
+
+    return 1;
+}
+
+/**
+ * @brief 构造并发送请求帧, 等收应答(错误路径已写入pRes)
+ *
+ * @return >0=应答帧长 0/负=失败(Note/Skip已填)
+ */
+static int HexSendRecv(DrvSerial_S *pDrv, const HxCase_S *pC,
+                       HxResult_S *pRes, unsigned char *pFrame)
+{
+    unsigned char Data[16];
+
+    unsigned char DataLen = 0;
+
+    int n;
+
+    if (BuildSetData(pC, Data, &DataLen) == 0)
+    {
+        pRes->Skip = 1;
+
+        snprintf(pRes->Note, sizeof(pRes->Note), "原值查询缓存无效, 跳过以免无法还原");
+
+        return 0;
+    }
+
+    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, DataLen, pC->ExpectLen, 0, pFrame);
+
+    if (n <= 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "%s",
+                 (n == -1) ? "发送失败" : "超时未收到应答");
+    }
+
+    return n;
 }
 
 /**
@@ -1318,10 +1682,6 @@ static void RunScaleQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRe
  */
 static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
 {
-    unsigned char Data[16];
-
-    unsigned char DataLen = 0;
-
     unsigned char Frame[HEX_FRAME_MAX];
 
     int n;
@@ -1339,60 +1699,20 @@ static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
         return;
     }
 
-    if (BuildSetData(pC, Data, &DataLen) == 0)
+    n = HexSendRecv(pDrv, pC, pRes, Frame);
+
+    if (n <= 0)
     {
-        pRes->Skip = 1;
-
-        snprintf(pRes->Note, sizeof(pRes->Note), "原值查询缓存无效, 跳过以免无法还原");
-
         return;
     }
 
-    n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, Data, DataLen, pC->ExpectLen, 0, Frame);
-
-    if (n == -1)
-    {
-        snprintf(pRes->Note, sizeof(pRes->Note), "发送失败");
-
-        return;
-    }
-
-    if (n == 0)
-    {
-        snprintf(pRes->Note, sizeof(pRes->Note), "超时未收到应答");
-
-        return;
-    }
-
-    if (pC->Type == HX_T_QUERY)
-    {
-        if (CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
-                       pRes->Note, (int)sizeof(pRes->Note)) == 0)
-        {
-            return;
-        }
-    }
-    else /* 动作类: 应答DATA[0]==0x00即过 */
-    {
-        if (HEX_RESP_DATALEN(Frame) < 1)
-        {
-            snprintf(pRes->Note, sizeof(pRes->Note), "应答无DATA域");
-
-            return;
-        }
-
-        if (HEX_RESP_DATA0(Frame) != 0x00)
-        {
-            snprintf(pRes->Note, sizeof(pRes->Note), "应答码0x%02X非0x00", HEX_RESP_DATA0(Frame));
-
-            return;
-        }
-
-        snprintf(pRes->Vals, sizeof(pRes->Vals), "%s", pC->Name);
-    }
-
-    pRes->Pass = 1;
+    pRes->Pass = HexCheckReply(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
+                               pRes->Note, (int)sizeof(pRes->Note));
 }
+
+/*===========================================================
+=                       主流程
+===========================================================*/
 
 /**
  * @brief 汇总表状态字符串
@@ -1412,105 +1732,179 @@ static const char *StatStr(const HxResult_S *pRes)
     return (pRes->Pass != 0) ? "PASS" : "FAIL";
 }
 
-int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
+/**
+ * @brief 汇总表单条说明列: 取结果对应的展示文本
+ */
+static const char *HexSummaryInfo(unsigned int i, int RunRisk)
 {
-    DrvSerial_S Serial = { .Fd = -1, .Dev = "/dev/ttyUSB0", .Baud = 921600 };
+    HxResult_S *pRes = &G_Result[i];
 
-    unsigned i;
+    if (pRes->Skip != 0)
+    {
+        return ((G_Cases[i].Group == HX_G_RISK) && (RunRisk == 0))
+               ? "风险组未启用" : pRes->Note;
+    }
 
-    int PassNum = 0;
+    if (pRes->Done == 0)
+    {
+        return "未执行(中断)";
+    }
+
+    if (pRes->Pass != 0)
+    {
+        return (pRes->Vals[0] != '\0') ? pRes->Vals : G_Cases[i].Name;
+    }
+
+    return (pRes->Note[0] != '\0') ? pRes->Note : "应答异常";
+}
+
+/**
+ * @brief 单条结果统计: 按状态累加
+ */
+static void HexCountResult(HxResult_S *pRes, int *pPass, int *pFail, int *pSkip)
+{
+    if (pRes->Skip != 0)
+    {
+        (*pSkip)++;
+    }
+    else if (pRes->Done && (pRes->Pass != 0))
+    {
+        (*pPass)++;
+    }
+    else if (pRes->Done)
+    {
+        (*pFail)++;
+    }
+}
+
+/**
+ * @brief 风险组还原执行并打印结果行(不计分)
+ */
+static void HexDoRestorePrint(DrvSerial_S *pDrv, const HxCase_S *pCase)
+{
+    int Ok = RunRestore(pDrv, pCase);
+
+    if (Ok < 0)
+    {
+        printf("     -> 还原 %s\n", "SKIP(缓存无效)");
+    }
+    else
+    {
+        printf("     -> 还原 %s\n", Ok ? "PASS" : "FAIL");
+    }
+}
+
+/** @brief 打印用例行头: [序号] 名称(补宽对齐) */
+static void PrintCaseHead(unsigned int i, const char *pName)
+{
+    printf("[%2u] ", i + 1);
+
+    PrintPad(pName, 26);
+}
+
+/** @brief 该用例是否需要风险组还原(已通过且程序运行中) */
+static int NeedRestore(const HxCase_S *pCase, const HxResult_S *pRes)
+{
+    return ((pCase->Group == HX_G_RISK) && (pCase->Restore != HX_R_NONE) &&
+            (pRes->Pass != 0) && G_Running);
+}
+
+/** @brief 打印单条用例结果行(PASS取Vals, FAIL/SKIP取Note) */
+static void PrintCaseResult(const HxCase_S *pCase, const HxResult_S *pRes)
+{
+    printf("%s  %s\n",
+           pRes->Pass ? "PASS" : (pRes->Skip ? "SKIP" : "FAIL"),
+           pRes->Pass ? (pRes->Vals[0] ? pRes->Vals : pCase->Name) : pRes->Note);
+}
+
+/**
+ * @brief 执行并打印单条用例(含风险组还原)
+ */
+static void HexRunOneCase(DrvSerial_S *pDrv, unsigned int i, int RunRisk)
+{
+    HxCase_S *pCase = &G_Cases[i];
+
+    if ((pCase->Group == HX_G_RISK) && (RunRisk == 0))
+    {
+        G_Result[i].Skip = 1;
+
+        PrintCaseHead(i, pCase->Name);
+
+        printf("SKIP  风险组未启用\n");
+
+        return;
+    }
+
+    PrintCaseHead(i, pCase->Name);
+
+    printf(".... ");
+
+    fflush(stdout);
+
+    RunCase(pDrv, pCase, &G_Result[i]);
+
+    PrintCaseResult(pCase, &G_Result[i]);
+
+    if (NeedRestore(pCase, &G_Result[i]) != 0)
+    {
+        HexDoRestorePrint(pDrv, pCase);
+    }
+}
+
+/**
+ * @brief 逐条执行全部用例
+ */
+static void HexRunAllCases(DrvSerial_S *pDrv, int RunRisk)
+{
+    unsigned int i;
+
+    for (i = 0; (i < CASE_NUM) && G_Running; i++)
+    {
+        HexRunOneCase(pDrv, i, RunRisk);
+    }
+}
+
+/**
+ * @brief 打印失败用例清单
+ */
+static void HexPrintFails(void)
+{
+    unsigned int i;
 
     int FailNum = 0;
 
-    int SkipNum = 0;
-
-    if (pDev != NULL)
+    for (i = 0; i < CASE_NUM; i++)
     {
-        strncpy(Serial.Dev, pDev, sizeof(Serial.Dev) - 1);
-
-        Serial.Dev[sizeof(Serial.Dev) - 1] = '\0';
-    }
-
-    if (Baud > 0)
-    {
-        Serial.Baud = Baud;
-    }
-
-    InstallSignal(SIGINT);
-
-    InstallSignal(SIGTERM);
-
-    printf("===== HEX协议验证器 V1.6.5 (设备 %s @%d, %s) =====\n",
-           Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
-
-    if (DrvSerialOpen(&Serial) != 0)
-    {
-        printf("打开串口失败\n");
-
-        return -1;
-    }
-
-    /* 半阻塞读: VTIME=1(100ms), 必须在DrvSerialOpen之后覆盖其VMIN=1配置 */
-    {
-        struct termios Opt;
-
-        tcgetattr(Serial.Fd, &Opt);
-
-        Opt.c_cc[VMIN] = 0;
-
-        Opt.c_cc[VTIME] = 1;
-
-        tcsetattr(Serial.Fd, TCSANOW, &Opt);
-    }
-
-    /* ---------- 逐条执行: 每条一行 ---------- */
-    for (i = 0; (i < CASE_NUM) && G_Running; i++)
-    {
-        HxCase_S *pCase = &G_Cases[i];
-
-        if ((pCase->Group == HX_G_RISK) && (RunRisk == 0))
+        if (G_Result[i].Done && (G_Result[i].Pass == 0) && (G_Result[i].Skip == 0))
         {
-            G_Result[i].Skip = 1;
-
-            printf("[%2u] %-20s SKIP  风险组未启用\n", i + 1, pCase->Name);
-
-            continue;
-        }
-
-        printf("[%2u] ", i + 1);
-
-        PrintPad(pCase->Name, 26);
-
-        printf(".... ");
-
-        fflush(stdout);
-
-        RunCase(&Serial, pCase, &G_Result[i]);
-
-        printf("%s  %s\n", G_Result[i].Pass ? "PASS" : (G_Result[i].Skip ? "SKIP" : "FAIL"),
-               G_Result[i].Pass ? (G_Result[i].Vals[0] ? G_Result[i].Vals : pCase->Name)
-                                 : (G_Result[i].Skip ? G_Result[i].Note : G_Result[i].Note));
-
-        /* 风险组还原: 验证通过后立即构造还原帧执行(不计分) */
-        if ((pCase->Group == HX_G_RISK) && (pCase->Restore != HX_R_NONE) &&
-            (G_Result[i].Pass != 0) && G_Running)
-        {
-            int Ok = RunRestore(&Serial, pCase);
-
-            if (Ok < 0)
-            {
-                printf("     -> 还原 %s\n", "SKIP(缓存无效)");
-            }
-            else
-            {
-                printf("     -> 还原 %s\n", Ok ? "PASS" : "FAIL");
-            }
+            FailNum++;
         }
     }
 
-    DrvSerialClose(&Serial);
+    if (FailNum == 0)
+    {
+        return;
+    }
 
-    /* ---------- 汇总表 ---------- */
+    printf("\n失败用例(需关注):\n");
+
+    for (i = 0; i < CASE_NUM; i++)
+    {
+        if (G_Result[i].Done && (G_Result[i].Pass == 0) && (G_Result[i].Skip == 0))
+        {
+            printf("  x %s : %s\n", G_Cases[i].Name,
+                   (G_Result[i].Note[0] != '\0') ? G_Result[i].Note : "应答异常");
+        }
+    }
+}
+
+/**
+ * @brief 打印汇总表与统计
+ */
+static void HexPrintSummary(int RunRisk, int *pPass, int *pFail, int *pSkip)
+{
+    unsigned int i;
+
     printf("\n==================== 验证结果汇总 ====================\n");
 
     PrintPad("序号", 5);
@@ -1523,68 +1917,110 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     for (i = 0; i < CASE_NUM; i++)
     {
-        HxResult_S *pRes = &G_Result[i];
-
-        const char *Stat = StatStr(pRes);
-
-        const char *Info;
-
-        if (pRes->Skip != 0)
-        {
-            Info = (G_Cases[i].Group == HX_G_RISK) && (RunRisk == 0)
-                   ? "风险组未启用" : pRes->Note;
-        }
-        else if (pRes->Done == 0)
-        {
-            Info = "未执行(中断)";
-        }
-        else if (pRes->Pass != 0)
-        {
-            Info = (pRes->Vals[0] != '\0') ? pRes->Vals : G_Cases[i].Name;
-        }
-        else
-        {
-            Info = (pRes->Note[0] != '\0') ? pRes->Note : "应答异常";
-        }
-
         printf("[%2u] ", i + 1);
 
         PrintPad(G_Cases[i].Name, 26);
 
-        printf("%-5s%s\n", Stat, Info);
+        printf("%-5s%s\n", StatStr(&G_Result[i]), HexSummaryInfo(i, RunRisk));
 
-        if (pRes->Skip != 0)
-        {
-            SkipNum++;
-        }
-        else if (pRes->Done && (pRes->Pass != 0))
-        {
-            PassNum++;
-        }
-        else if (pRes->Done)
-        {
-            FailNum++;
-        }
+        HexCountResult(&G_Result[i], pPass, pFail, pSkip);
     }
 
     printf("------------------------------------------------------\n");
 
     printf("通过 PASS %d / 失败 FAIL %d / 跳过 SKIP %d / 共 %u 条\n",
-           PassNum, FailNum, SkipNum, (unsigned)CASE_NUM);
+           *pPass, *pFail, *pSkip, (unsigned)CASE_NUM);
+}
 
-    if (FailNum > 0)
+/**
+ * @brief 覆盖DrvSerialOpen的VMIN=1为半阻塞读(VMIN=0/VTIME=1)
+ */
+static void HexApplyVtime(DrvSerial_S *pSerial)
+{
+    struct termios Opt;
+
+    tcgetattr(pSerial->Fd, &Opt);
+
+    Opt.c_cc[VMIN] = 0;
+
+    Opt.c_cc[VTIME] = 1;
+
+    tcsetattr(pSerial->Fd, TCSANOW, &Opt);
+}
+
+/** @brief 填充串口参数(默认ttyUSB0/921600, 显式参数优先) */
+static void HexFillArgs(DrvSerial_S *pSerial, const char *pDev, int Baud)
+{
+    memset(pSerial, 0, sizeof(*pSerial));
+
+    pSerial->Fd = -1;
+
+    strcpy(pSerial->Dev, "/dev/ttyUSB0");
+
+    pSerial->Baud = 921600;
+
+    if (pDev != NULL)
     {
-        printf("\n失败用例(需关注):\n");
+        strncpy(pSerial->Dev, pDev, sizeof(pSerial->Dev) - 1);
 
-        for (i = 0; i < CASE_NUM; i++)
-        {
-            if (G_Result[i].Done && (G_Result[i].Pass == 0) && (G_Result[i].Skip == 0))
-            {
-                printf("  x %s : %s\n", G_Cases[i].Name,
-                       (G_Result[i].Note[0] != '\0') ? G_Result[i].Note : "应答异常");
-            }
-        }
+        pSerial->Dev[sizeof(pSerial->Dev) - 1] = '\0';
     }
+
+    if (Baud > 0)
+    {
+        pSerial->Baud = Baud;
+    }
+}
+
+/** @brief 打印横幅并打开串口(含VMIN/VTIME覆盖)
+ *
+ * @return 0=成功 -1=打开失败
+ */
+static int HexOpenDevice(DrvSerial_S *pSerial, int RunRisk)
+{
+    printf("===== HEX协议验证器 V1.6.6 (设备 %s @%d, %s) =====\n",
+           pSerial->Dev, pSerial->Baud, RunRisk ? "安全组+风险组" : "仅安全组");
+
+    if (DrvSerialOpen(pSerial) != 0)
+    {
+        printf("打开串口失败\n");
+
+        return -1;
+    }
+
+    HexApplyVtime(pSerial);
+
+    return 0;
+}
+
+int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
+{
+    DrvSerial_S Serial;
+
+    int PassNum = 0;
+
+    int FailNum = 0;
+
+    int SkipNum = 0;
+
+    HexFillArgs(&Serial, pDev, Baud);
+
+    InstallSignal(SIGINT);
+
+    InstallSignal(SIGTERM);
+
+    if (HexOpenDevice(&Serial, RunRisk) != 0)
+    {
+        return -1;
+    }
+
+    HexRunAllCases(&Serial, RunRisk);
+
+    DrvSerialClose(&Serial);
+
+    HexPrintSummary(RunRisk, &PassNum, &FailNum, &SkipNum);
+
+    HexPrintFails();
 
     return (FailNum > 0) ? 1 : 0;
 }
