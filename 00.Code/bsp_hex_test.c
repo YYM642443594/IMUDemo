@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.5.0
+ * @version V1.5.1
  * @date    2026-10-20
  * @brief   志翔IMU HEX交互协议逐报文验证器
  *
@@ -26,6 +26,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.5.1<td>2026-10-20<td>杨镒铭<td>输出对齐: 名称列改按UTF-8显示宽度补空格(中文按2列), 逐条行与汇总表PASS/FAIL列对齐
  * <tr><td>V1.5.0<td>2026-10-20<td>杨镒铭<td>创建: 18个报文ID全覆盖, 安全组11查询+YAW归零,
  *     风险组RAM写入成对动态还原(频率/算法模式/推送状态/报文ID/PPS/坐标系/磁力计/零偏),
  *     时间同步主机时间(掉电不保存), 复位重启置表末; 有意排除掉电保存与断链类
@@ -257,6 +258,51 @@ static double NowMs(void)
     clock_gettime(CLOCK_MONOTONIC, &Ts);
 
     return (double)Ts.tv_sec * 1000.0 + (double)Ts.tv_nsec / 1e6;
+}
+
+/**
+ * @brief UTF-8字符串显示宽度(CJK等多字节字符按2列计)
+ */
+static int DispWidth(const char *pS)
+{
+    int W = 0;
+
+    const unsigned char *p = (const unsigned char *)pS;
+
+    while (*p != '\0')
+    {
+        int n = 1;
+
+        if ((*p & 0xE0) == 0xC0)       { n = 2; }
+        else if ((*p & 0xF0) == 0xE0)  { n = 3; } /* CJK为主 */
+        else if ((*p & 0xF8) == 0xF0)  { n = 4; }
+
+        W += (n == 1) ? 1 : 2;
+
+        while ((n > 0) && (*p != '\0'))
+        {
+            p++;
+
+            n--;
+        }
+    }
+
+    return W;
+}
+
+/**
+ * @brief 打印字符串并按显示宽度补空格(中文名对齐, %-20s按字节补齐会错位)
+ */
+static void PrintPad(const char *pS, int Width)
+{
+    int W = DispWidth(pS);
+
+    fputs(pS, stdout);
+
+    for (; W < Width; W++)
+    {
+        putchar(' ');
+    }
 }
 
 /**
@@ -1104,7 +1150,7 @@ int main(int argc, char *argv[])
 
     InstallSignal(SIGTERM);
 
-    printf("===== HEX协议验证器 V1.5.0 (设备 %s @%d, %s) =====\n",
+    printf("===== HEX协议验证器 V1.5.1 (设备 %s @%d, %s) =====\n",
            Serial.Dev, Serial.Baud, RunRisk ? "安全组+风险组" : "仅安全组");
 
     if (DrvSerialOpen(&Serial) != 0)
@@ -1141,7 +1187,11 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        printf("[%2u] %-20s .... ", i + 1, pCase->Name);
+        printf("[%2u] ", i + 1);
+
+        PrintPad(pCase->Name, 26);
+
+        printf(".... ");
 
         fflush(stdout);
 
@@ -1173,7 +1223,13 @@ int main(int argc, char *argv[])
     /* ---------- 汇总表 ---------- */
     printf("\n==================== 验证结果汇总 ====================\n");
 
-    printf("%-4s %-20s %-4s %s\n", "序号", "报文用例", "结果", "说明");
+    PrintPad("序号", 5);
+
+    PrintPad("报文用例", 26);
+
+    PrintPad("结果", 5);
+
+    printf("说明\n");
 
     for (i = 0; i < CASE_NUM; i++)
     {
@@ -1201,7 +1257,11 @@ int main(int argc, char *argv[])
             Info = (pRes->Note[0] != '\0') ? pRes->Note : "应答异常";
         }
 
-        printf("[%2u] %-20s %-4s %s\n", i + 1, G_Cases[i].Name, Stat, Info);
+        printf("[%2u] ", i + 1);
+
+        PrintPad(G_Cases[i].Name, 26);
+
+        printf("%-5s%s\n", Stat, Info);
 
         if (pRes->Skip != 0)
         {
