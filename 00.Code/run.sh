@@ -65,7 +65,23 @@ BAUD="${2:-921600}"
 SECS="${3:-0}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ---- 1. 构建(单程序, 三功能合一) ----
+# ---- 1. 使用说明(每次运行显示; 详细帮助: ./run.sh -h) ----
+echo "============================================================"
+echo " IMU Linux 验证工具 (run.sh)"
+echo " 用法: ./run.sh [串口设备] [波特率] [持续秒数]  三参数均可省略"
+echo "------------------------------------------------------------"
+echo "  串口设备   默认 /dev/ttyUSB0  (查看: ls /dev/ttyUSB* /dev/ttyACM*)"
+echo "  波特率     默认 921600        (9600/.../460800/921600 八档)"
+echo "  持续秒数   默认 0=直到Ctrl-C  (仅功能1数据流统计使用)"
+echo "  功能菜单   1=数据流统计  2=AT指令验证  3=HEX协议验证"
+echo "             交互时不确定直接回车, 一律取安全默认值"
+echo "  详细帮助   ./run.sh -h"
+echo "  免菜单直跑 ./imu_test [串口] [波特率] [功能1/2/3] [参数]"
+echo "------------------------------------------------------------"
+echo " 本次参数: 串口=$DEV  波特率=$BAUD  持续秒数=$SECS"
+echo "============================================================"
+
+# ---- 2. 构建(单程序, 三功能合一) ----
 echo "== Build =="
 gcc -O2 -Wall -o "$DIR/imu_test" \
     "$DIR/main.c" "$DIR/drv_serial.c" \
@@ -74,7 +90,7 @@ gcc -O2 -Wall -o "$DIR/imu_test" \
     -lpthread || { echo "Build imu_test Fail"; exit 1; }
 echo "Build OK (imu_test: 1=数据流统计 2=AT指令验证 3=HEX协议验证)"
 
-# ---- 2. 串口存在性检查 ----
+# ---- 3. 串口存在性检查 ----
 if [ ! -e "$DEV" ]; then
     echo "Serial $DEV not exist!"
     echo "Available:"
@@ -82,7 +98,7 @@ if [ ! -e "$DEV" ]; then
     exit 1
 fi
 
-# ---- 3. 检查占用 ----
+# ---- 4. 检查占用 ----
 if command -v lsof >/dev/null 2>&1; then
     if lsof "$DEV" >/dev/null 2>&1; then
         echo "WARN: $DEV occupied by:"
@@ -91,14 +107,12 @@ if command -v lsof >/dev/null 2>&1; then
     fi
 fi
 
-# ---- 4. 功能选择 ----
-echo ""
-echo "(当前参数: 串口=$DEV 波特率=$BAUD 持续秒数=$SECS; 完整帮助: ./run.sh -h)"
+# ---- 5. 功能选择 ----
 echo ""
 echo "请选择功能:"
-echo "  1) 数据流统计验证 (uart_stat: 帧率/间隔/CRC/解析)"
-echo "  2) AT指令验证     (at_test: 逐条验证+配置还原)"
-echo "  3) HEX协议验证    (hex_test: 3.2章报文逐ID验证+RAM配置还原)"
+echo "  1) 数据流统计验证 (帧率/间隔/CRC/数据包1~4解析)"
+echo "  2) AT指令验证     (逐条下发验证, 配置自动还原)"
+echo "  3) HEX协议验证    (3.2章报文逐ID验证, RAM配置自动还原)"
 printf "选择 [1/2/3, 回车=1]: "
 read -r CHOICE
 
