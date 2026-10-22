@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_can_test.c
  * @author  杨镒铭
- * @version V1.1.0
+ * @version V1.2.0
  * @date    2026-10-21
  * @brief   志翔IMU CAN交互协议逐指令验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -38,6 +38,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.2.0<td>2026-10-22<td>杨镒铭<td>新增压力/暴力模式(功能2第3参数=2, BspCanTestRun内部分发): 无效请求静默(非法Op0xFF+未知ID0x116)/高频连发200帧不等应答/未知ID轰炸200轮(随机0x116~0x1FF后合法查询验证恢复)/fuzz随机请求轰炸500帧(固定种子可复现, 只用查询ID集+随机Op与参数无持久副作用); 每项结束版本查询探活(3重试), 失败自动0x110复位兜底; CAN适配: 无字节流截断概念以未知ID轰炸替代HEX截断恢复项
  * <tr><td>V1.1.0<td>2026-10-21<td>杨镒铭<td>新增异常组8条(与风险组同开关, 预期以固件实际行为为准): 无效操作符静默(0x100/0x105/0x115非法类型/未知ID0x116均无应答), 无效操作符无效应答(0x101回全0), 非法频率档回落50Hz验证, 非法坐标系/PPS模式直写行为确认+还原; 新增写查还原三步用例类型CN_T_ABN_WQ
  * <tr><td>V1.0.0<td>2026-10-21<td>杨镒铭<td>创建: 参照串口HEX验证器(bsp_hex_test.c)架构实现CAN版: 16个ID共24条用例(安全组15查询+YAW归零, 风险组RAM写入7条自动还原, 复位置表末), 查询校验键->函数分发表, 缓存驱动还原, 内核过滤器隔离数据流
  *   </table>
@@ -1212,9 +1213,22 @@ static int NeedRestore(const CnCase_S *pCase, const CnResult_S *pRes)
             (pRes->Pass != 0) && G_Running);
 }
 
-/**
- * @brief 执行并打印单条用例(含风险组还原)
- */
+/** @brief 按需还原: ABN_WQ无条件还原, 风险写入按NeedRestore判定 */
+static void CnRestoreIfNeeded(DrvSocketCan_S *pDrv, CnCase_S *pCase, CnResult_S *pRes)
+{
+    if (pCase->Type == CN_T_ABN_WQ)
+    {
+        CnDoRestorePrint(pDrv, pCase); /* 异常写查后无条件还原, 保设备状态 */
+
+        return;
+    }
+
+    if (NeedRestore(pCase, pRes) != 0)
+    {
+        CnDoRestorePrint(pDrv, pCase);
+    }
+}
+
 static void CnRunOneCase(DrvSocketCan_S *pDrv, unsigned int i, int RunRisk)
 {
     CnCase_S *pCase = &G_Cases[i];
@@ -1240,14 +1254,7 @@ static void CnRunOneCase(DrvSocketCan_S *pDrv, unsigned int i, int RunRisk)
 
     PrintCaseResult(pCase, &G_Result[i]);
 
-    if (pCase->Type == CN_T_ABN_WQ)
-    {
-        CnDoRestorePrint(pDrv, pCase); /* 异常写查后无条件还原, 保设备状态 */
-    }
-    else if (NeedRestore(pCase, &G_Result[i]) != 0)
-    {
-        CnDoRestorePrint(pDrv, pCase);
-    }
+    CnRestoreIfNeeded(pDrv, pCase, &G_Result[i]);
 }
 
 /** @brief 遍历执行全部用例(Ctrl-C后停止执行新用例) */
@@ -1305,6 +1312,328 @@ static void CnPrintFails(void)
     }
 }
 
+/*===========================================================
+=                  压力/暴力模式 (RunRisk=2)
+=  职责: 异常请求轰炸下验证固件CAN栈鲁棒性与自恢复能力
+=  约束: 压力帧全部无持久副作用(只用查询ID+查询操作符/非法Op,
+=        不碰波特率/量程/复位类ID), 每项结束探活, 失败复位兜底
+===========================================================*/
+
+#define CN_STRESS_BADID_N   200   /* 未知ID轰炸帧数 */
+#define CN_STRESS_BURST_N   200   /* 高频连发帧数 */
+#define CN_STRESS_FUZZ_N    500   /* fuzz随机请求总数 */
+
+/** @brief 压力汇总计数 */
+static int G_StressPass = 0;
+
+static int G_StressFail = 0;
+
+/** @brief 排空socket接收缓冲残留帧(探活/每项开始前) */
+static void CnDrainRx(DrvSocketCan_S *pDrv)
+{
+    struct can_frame Frame;
+
+    while (DrvSocketCanRecv(pDrv, &Frame) == 0)
+    {
+        /* 丢弃全部残留应答 */
+    }
+}
+
+/**
+ * @brief 探活: 版本查询验证固件存活(3次重试, 间隔300ms)
+ *
+ * @return 1=存活 0=无响应
+ */
+static int CnProbe(DrvSocketCan_S *pDrv)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    int Retry;
+
+    for (Retry = 0; Retry < 3; Retry++)
+    {
+        CnDrainRx(pDrv);
+
+        if (CanSendReq(pDrv, CAN_ID_VERSION, CAN_OP_QUERY, NULL) == 0)
+        {
+            if (CanRecvMatch(pDrv, CAN_ID_VERSION, Resp, 400.0) > 0)
+            {
+                return 1;
+            }
+        }
+
+        usleep(300000);
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 兜底恢复: 发0x110复位重启设备后重新探活
+ *
+ * @return 1=恢复 0=彻底无响应
+ */
+static int CnRecover(DrvSocketCan_S *pDrv)
+{
+    unsigned char Data[CAN_TEST_DLC - 1] = { 0x01 };
+
+    printf("  [兜底] 探活失败, 发送0x110复位重启设备...\n");
+
+    (void)CanSendReq(pDrv, CAN_ID_RESET, CAN_OP_RAM, Data);
+
+    sleep(4); /* 复位重启+初始化窗口 */
+
+    return CnProbe(pDrv);
+}
+
+/**
+ * @brief 单项收尾: 探活+兜底+结果计数与打印
+ */
+static void CnCheckAlive(DrvSocketCan_S *pDrv, const char *pName, int Ok0,
+                         const char *pDetail)
+{
+    int Alive = CnProbe(pDrv);
+
+    if (Alive == 0)
+    {
+        Alive = CnRecover(pDrv);
+    }
+
+    if (Ok0 && Alive)
+    {
+        G_StressPass++;
+
+        printf("PASS %s (%s)\n", pName, pDetail);
+    }
+    else
+    {
+        G_StressFail++;
+
+        printf("FAIL %s (%s, 探活%s)\n", pName, pDetail,
+               Alive ? "不通过" : "无响应且兜底复位无效");
+    }
+}
+
+/**
+ * @brief 无效请求静默: 非法操作符0xFF+未知ID 0x116, 预期均无应答
+ *
+ * @return 1=全部符合预期 0=出现意外应答
+ */
+static int CnStressNoAns(DrvSocketCan_S *pDrv)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    unsigned char Data[CAN_TEST_DLC - 1] = { 0x00 };
+
+    int Ok1, Ok2;
+
+    CnDrainRx(pDrv);
+
+    (void)CanSendReq(pDrv, CAN_ID_VERSION, 0xFF, Data);
+
+    Ok1 = (CanRecvMatch(pDrv, CAN_ID_VERSION, Resp, 400.0) > 0) ? 0 : 1;
+
+    CnDrainRx(pDrv);
+
+    (void)CanSendReq(pDrv, CAN_ID_UNKNOWN, CAN_OP_QUERY, Data);
+
+    Ok2 = (CanRecvMatch(pDrv, CAN_ID_UNKNOWN, Resp, 400.0) > 0) ? 0 : 1;
+
+    return (Ok1 == 1 && Ok2 == 1) ? 1 : 0;
+}
+
+/**
+ * @brief 高频连发: 版本查询200帧不等应答连灌, 之后收剩余应答统计
+ */
+static void CnStressBurst(DrvSocketCan_S *pDrv, int *pSent, int *pRecvCnt)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    int i;
+
+    CnDrainRx(pDrv);
+
+    for (i = 0; i < CN_STRESS_BURST_N; i++)
+    {
+        if (CanSendReq(pDrv, CAN_ID_VERSION, CAN_OP_QUERY, NULL) == 0)
+        {
+            (*pSent)++;
+        }
+    }
+
+    usleep(50000);
+
+    while (CanRecvMatch(pDrv, CAN_ID_VERSION, Resp, 300.0) > 0)
+    {
+        (*pRecvCnt)++;
+    }
+
+    printf("       连发%d帧, 收到应答%d帧\n", *pSent, *pRecvCnt);
+}
+
+/**
+ * @brief 未知ID轰炸单轮: 随机越界ID一帧+合法版本查询验证恢复
+ *
+ * @return 1=合法查询恢复应答 0=未恢复
+ */
+static int BadIdOneRound(DrvSocketCan_S *pDrv, unsigned short BadId)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    CnDrainRx(pDrv);
+
+    (void)CanSendReq(pDrv, BadId, CAN_OP_QUERY, NULL);
+
+    usleep(2000);
+
+    (void)CanSendReq(pDrv, CAN_ID_VERSION, CAN_OP_QUERY, NULL);
+
+    return (CanRecvMatch(pDrv, CAN_ID_VERSION, Resp, 300.0) > 0) ? 1 : 0;
+}
+
+/**
+ * @brief 未知ID轰炸: 随机越界ID(0x116~0x1FF)共200轮, 统计恢复轮数
+ */
+static int CnStressBadId(DrvSocketCan_S *pDrv)
+{
+    int i;
+
+    int OkCnt = 0;
+
+    srand(0x03692);
+
+    for (i = 0; i < CN_STRESS_BADID_N; i++)
+    {
+        unsigned short BadId = 0x116 + (unsigned short)(rand() % 0xEA);
+
+        OkCnt += BadIdOneRound(pDrv, BadId);
+    }
+
+    printf("       %d轮轰炸中恢复应答%d轮\n", CN_STRESS_BADID_N, OkCnt);
+
+    return OkCnt;
+}
+
+/**
+ * @brief fuzz单帧: 合法查询ID+随机操作符与随机参数(无持久副作用ID集)
+ */
+static void FuzzOneReq(DrvSocketCan_S *pDrv)
+{
+    unsigned short Ids[3] = { CAN_ID_VERSION, CAN_ID_UNKNOWN, CAN_ID_SN_LO };
+
+    unsigned char Data[7];
+
+    int i;
+
+    for (i = 0; i < 7; i++)
+    {
+        Data[i] = (unsigned char)(rand() & 0xFF);
+    }
+
+    (void)CanSendReq(pDrv, Ids[rand() % 3], (unsigned char)(rand() & 0x03), Data);
+}
+
+/**
+ * @brief fuzz随机请求轰炸: 固定种子可复现, 每100帧暂停排空
+ *
+ * @return 实际发送帧数
+ */
+static int CnStressFuzz(DrvSocketCan_S *pDrv)
+{
+    int i;
+
+    int Sent = 0;
+
+    srand(0x0100);
+
+    for (i = 0; i < CN_STRESS_FUZZ_N; i++)
+    {
+        FuzzOneReq(pDrv);
+
+        Sent++;
+
+        if ((i % 100) == 99)
+        {
+            usleep(20000);
+
+            CnDrainRx(pDrv);
+        }
+    }
+
+    return Sent;
+}
+
+/**
+ * @brief 压力项组1: 无效应答/高频连发/未知ID轰炸(逐项探活+报告)
+ */
+static void CnStressSync(DrvSocketCan_S *pDrv)
+{
+    int Sent = 0, RecvCnt = 0, NoAnsOk, BadIdOk;
+
+    NoAnsOk = CnStressNoAns(pDrv);
+
+    CnCheckAlive(pDrv, "无效请求静默(非法Op/未知ID)",
+                 NoAnsOk, NoAnsOk ? "无意外应答" : "收到意外应答");
+
+    CnStressBurst(pDrv, &Sent, &RecvCnt);
+
+    CnCheckAlive(pDrv, "高频连发", RecvCnt >= 1, "连发后收应答");
+
+    BadIdOk = CnStressBadId(pDrv);
+
+    CnCheckAlive(pDrv, "未知ID轰炸恢复", BadIdOk >= (CN_STRESS_BADID_N * 9) / 10,
+                 "恢复率");
+}
+
+/**
+ * @brief 依次执行全部压力项并打印汇总
+ */
+static void CnStressRunAll(DrvSocketCan_S *pDrv)
+{
+    int Sent;
+
+    CnStressSync(pDrv);
+
+    Sent = CnStressFuzz(pDrv);
+
+    CnCheckAlive(pDrv, "fuzz随机请求轰炸", 1, "轰炸后");
+
+    printf("       发送%d帧\n", Sent);
+
+    printf("===== 压力测试汇总: PASS %d / FAIL %d =====\n", G_StressPass, G_StressFail);
+}
+
+/**
+ * @brief CAN压力/暴力验证入口(功能2第3参数=2)
+ *
+ * @return 0=全部通过 1=存在失败 -1=接口打开失败
+ */
+static int CnStressRun(const char *pIfName)
+{
+    DrvSocketCan_S DrvCan;
+
+    memset(&DrvCan, 0, sizeof(DrvCan));
+
+    InstallSignal(SIGINT);
+
+    InstallSignal(SIGTERM);
+
+    printf("===== CAN压力/暴力验证器 (接口 %s) =====\n", pIfName);
+
+    if (CanTestOpen(&DrvCan, pIfName) != 0)
+    {
+        printf("打开CAN接口失败(请检查接口存在/已UP/权限)\n");
+
+        return -1;
+    }
+
+    CnStressRunAll(&DrvCan);
+
+    DrvCloseSocketCan(&DrvCan);
+
+    return (G_StressFail > 0) ? 1 : 0;
+}
+
 /** @brief 打印横幅并打开CAN接口
  *
  * @return 0=成功 -1=打开失败
@@ -1338,6 +1667,11 @@ static void CnSetup(void)
 
 int BspCanTestRun(const char *pIfName, int RunRisk)
 {
+    if (RunRisk == 2)
+    {
+        return CnStressRun(pIfName);
+    }
+
     DrvSocketCan_S DrvCan;
     int PassNum = 0;
     int FailNum = 0;

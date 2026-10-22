@@ -151,13 +151,15 @@ static void PrintUsage(const char *pProg)
 {
     printf("Usage:\r\n");
     printf("    %s can0 [持续秒数]   功能1: 数据流统计(0或省略=直到Ctrl-C)\r\n", pProg);
-    printf("    %s can0 2 [0/1]      功能2: CAN指令验证(0=仅安全组, 1=含风险组)\r\n", pProg);
+    printf("    %s can0 2 [0/1/2]    功能2: CAN指令验证(0=仅安全组, 1=风险+异常组,\r\n", pProg);
+    printf("                         2=压力/暴力测试: 未知ID轰炸/fuzz/高频连发)\r\n");
     printf("    %s -h                显示本帮助\r\n", pProg);
     printf("功能说明:\r\n");
     printf("    1 数据流统计: 0x091~0x098帧率/帧间隔/时间戳Δt统计与实时解析,\r\n");
     printf("                  按需自动下发0x103开启推送(数据正常时永不发送)\r\n");
     printf("    2 CAN指令验证: 0x100~0x115逐指令实测, 查询值域校验,\r\n");
-    printf("                  风险组RAM写入验证后自动还原(还原不计分)\r\n");
+    printf("                  风险组RAM写入验证后自动还原(还原不计分);\r\n");
+    printf("                  模式2压力测试每项探活, 失败自动0x110复位兜底\r\n");
     printf("CAN接口前置配置(波特率需与IMU一致, 协议默认1000K):\r\n");
     printf("    sudo ip link set can0 down\r\n");
     printf("    sudo ip link set can0 type can bitrate 1000000\r\n");
