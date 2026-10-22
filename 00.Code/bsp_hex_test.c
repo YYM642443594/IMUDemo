@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.8
+ * @version V1.6.9
  * @date    2026-10-22
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -35,6 +35,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.9<td>2026-10-22<td>杨镒铭<td>新增压力/暴力模式(功能3模式2, BspHexTestRun内部分发): fuzz随机帧轰炸1000帧(固定种子可复现)/高频连发200帧不等应答/垃圾前缀重同步50轮/截断帧恢复10轮/CRC低字节错+未知CMD无效应答; 每项结束版本查询探活(3重试), 失败自动复位兜底; 压力帧全程无持久副作用
  * <tr><td>V1.6.8<td>2026-10-22<td>杨镒铭<td>新增异常组9条(与风险组同开关, 总32条): 0x0008磁力计校准固件0x00分发表未实现(文档3.2.2有, 真机3.0.0.5实测静默, 自风险组转异常组预期无应答)+CRC错误帧/非法操作符/未知ID/Len超限静默无应答+频率非法操作符无效应答(DATA[0]=0)+非法值写入->行为查询3条(频率档回落5/坐标系837直写/PPS模式归零, 依固件bsp_parse.c行为), ABN_WQ还原外层统一执行; 删无引用HX_R_MAG_OFF
  * <tr><td>V1.6.7<td>2026-10-21<td>杨镒铭<td>消构建告警: MarkVals拼接改足量中间缓冲+限长memcpy拷回(替代二次snprintf), 免-Wformat-truncation, 截断保头行为不变
  * <tr><td>V1.6.6<td>2026-10-21<td>杨镒铭<td>函数长度规范重构(单函数≤30行): CheckQuery按校验键拆12个小函数+分发表, BuildSetData/RunRestore按类型拆构造函数, RunScaleQuery拆探测/诊断两阶段, 主流程拆单条执行/汇总/失败清单, TryExtractFrame/HexRecvFrame/RunCase等同步拆分, 行为不变
@@ -1923,17 +1924,25 @@ static int HexSendRecv(DrvSerial_S *pDrv, const HxCase_S *pC,
 /**
  * @brief 执行单条用例(安静模式, 不打印过程)
  */
+/**
+ * @brief 复位结果槽(每条执行前)
+ */
+static void ResetResult(HxResult_S *pRes)
+{
+    pRes->Vals[0] = '\0';
+
+    pRes->Note[0] = '\0';
+
+    pRes->Done = 1;
+}
+
 static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
 {
     unsigned char Frame[HEX_FRAME_MAX];
 
     int n;
 
-    pRes->Vals[0] = '\0';
-
-    pRes->Note[0] = '\0';
-
-    pRes->Done = 1;
+    ResetResult(pRes);
 
     if (pC->Type == HX_T_ABN_WQ) { RunAbnWqCase(pDrv, pC, pRes); return; }
 
@@ -2067,6 +2076,24 @@ static void PrintCaseResult(const HxCase_S *pCase, const HxResult_S *pRes)
 /**
  * @brief 执行并打印单条用例(含风险组还原)
  */
+/**
+ * @brief 按需还原: ABN_WQ无条件还原, 风险写入按NeedRestore判定
+ */
+static void RestoreIfNeeded(DrvSerial_S *pDrv, HxCase_S *pCase, HxResult_S *pRes)
+{
+    if (pCase->Type == HX_T_ABN_WQ)
+    {
+        HexDoRestorePrint(pDrv, pCase); /* 异常写查后无条件还原, 保设备状态 */
+
+        return;
+    }
+
+    if (NeedRestore(pCase, pRes) != 0)
+    {
+        HexDoRestorePrint(pDrv, pCase);
+    }
+}
+
 static void HexRunOneCase(DrvSerial_S *pDrv, unsigned int i, int RunRisk)
 {
     HxCase_S *pCase = &G_Cases[i];
@@ -2092,14 +2119,7 @@ static void HexRunOneCase(DrvSerial_S *pDrv, unsigned int i, int RunRisk)
 
     PrintCaseResult(pCase, &G_Result[i]);
 
-    if (pCase->Type == HX_T_ABN_WQ)
-    {
-        HexDoRestorePrint(pDrv, pCase); /* 异常写查后无条件还原, 保设备状态 */
-    }
-    else if (NeedRestore(pCase, &G_Result[i]) != 0)
-    {
-        HexDoRestorePrint(pDrv, pCase);
-    }
+    RestoreIfNeeded(pDrv, pCase, &G_Result[i]);
 }
 
 /**
@@ -2223,15 +2243,12 @@ static void HexFillArgs(DrvSerial_S *pSerial, const char *pDev, int Baud)
     }
 }
 
-/** @brief 打印横幅并打开串口(含VMIN/VTIME覆盖)
+/** @brief 打开串口(含VMIN/VTIME覆盖)
  *
  * @return 0=成功 -1=打开失败
  */
-static int HexOpenDevice(DrvSerial_S *pSerial, int RunRisk)
+static int HexOpenDevice(DrvSerial_S *pSerial)
 {
-    printf("===== HEX协议验证器 V1.6.8 (设备 %s @%d, %s) =====\n",
-           pSerial->Dev, pSerial->Baud, RunRisk ? "安全+风险+异常组" : "仅安全组");
-
     if (DrvSerialOpen(pSerial) != 0)
     {
         printf("打开串口失败\n");
@@ -2244,7 +2261,450 @@ static int HexOpenDevice(DrvSerial_S *pSerial, int RunRisk)
     return 0;
 }
 
-int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
+/*===========================================================
+=                  压力/暴力模式 (Mode=2)
+=  职责: 异常输入轰炸下验证固件鲁棒性与自恢复能力
+=  约束: 压力帧全部无持久副作用(随机字段命中写入ID时固件按CRC
+=        静默丢弃, 概率可忽略), 每项结束探活, 失败自动复位兜底
+===========================================================*/
+
+#define HEX_STRESS_FUZZ_N    1000  /* fuzz随机帧总数 */
+#define HEX_STRESS_GARBAGE_N 50    /* 垃圾前缀轮数 */
+#define HEX_STRESS_BURST_N   200   /* 高频连发帧数 */
+#define HEX_STRESS_TRUNC_N   10    /* 截断帧轮数 */
+
+/** @brief 压力汇总计数 */
+static int G_StressPass = 0;
+
+static int G_StressFail = 0;
+
+/**
+ * @brief 排空串口残留并清工具侧滑窗(探活/每项开始前)
+ */
+static void StressFlush(DrvSerial_S *pDrv)
+{
+    tcflush(pDrv->Fd, TCIOFLUSH);
+
+    G_RxLen = 0;
+}
+
+/**
+ * @brief 探活: 发版本查询验证固件存活(3次重试, 间隔300ms)
+ *
+ * @return 1=存活 0=无响应
+ */
+static int StressProbe(DrvSerial_S *pDrv)
+{
+    unsigned char Req[16];
+
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int Retry;
+
+    int ReqLen = HexBuildReq(HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                             HEX_OP_QUERY, NULL, 0, Req);
+
+    for (Retry = 0; Retry < 3; Retry++)
+    {
+        StressFlush(pDrv);
+
+        if (DrvSerialSend(pDrv, Req, ReqLen) == 0)
+        {
+            if (HexRecvFrame(pDrv, HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                             0, 0, Frame, 400) > 0)
+            {
+                return 1;
+            }
+        }
+
+        usleep(300000);
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 兜底恢复: 发复位帧重启设备后重新探活
+ *
+ * @return 1=恢复 0=彻底无响应
+ */
+static int StressRecover(DrvSerial_S *pDrv)
+{
+    unsigned char Req[HEX_FRAME_MAX];
+
+    unsigned char Confirm[9] = { 0x01 };
+
+    int ReqLen = HexBuildReq(HEX_ID_H(HEX_ID_RESET), HEX_ID_L(HEX_ID_RESET),
+                             HEX_OP_RAM, Confirm, 9, Req);
+
+    printf("  [兜底] 探活失败, 发送复位帧重启设备...\n");
+
+    DrvSerialSend(pDrv, Req, ReqLen);
+
+    sleep(4); /* 复位重启+初始化窗口 */
+
+    return StressProbe(pDrv);
+}
+
+/**
+ * @brief 单项收尾: 探活+兜底+结果计数与打印
+ *
+ * @param Ok0    该项自身的判定(探活也须通过才算PASS)
+ * @param pDetail 该项明细文本
+ */
+static void StressCheckAlive(DrvSerial_S *pDrv, const char *pName, int Ok0, const char *pDetail)
+{
+    int Alive = StressProbe(pDrv);
+
+    if (Alive == 0)
+    {
+        Alive = StressRecover(pDrv);
+    }
+
+    if (Ok0 && Alive)
+    {
+        G_StressPass++;
+
+        printf("PASS %s (%s)\n", pName, pDetail);
+    }
+    else
+    {
+        G_StressFail++;
+
+        printf("FAIL %s (%s, 探活%s)\n", pName, pDetail,
+               Alive ? "不通过" : "无响应且兜底复位无效");
+    }
+}
+
+/**
+ * @brief 填充一个随机帧(50%概率伪造AA55帧头, 其余全随机)
+ */
+static void FuzzFillFrame(unsigned char *pBuf, int Len)
+{
+    int i;
+
+    if ((rand() & 1) == 0)
+    {
+        pBuf[0] = 0xAA;
+
+        pBuf[1] = 0x55;
+    }
+
+    for (i = 0; i < Len; i++)
+    {
+        pBuf[i] = (unsigned char)(rand() & 0xFF);
+    }
+}
+
+/**
+ * @brief fuzz随机帧轰炸: 固定种子可复现, 每200帧暂停排空
+ */
+static int StressFuzz(DrvSerial_S *pDrv)
+{
+    unsigned char Buf[72];
+
+    int i;
+
+    int Sent = 0;
+
+    srand(0x3692);
+
+    for (i = 0; i < HEX_STRESS_FUZZ_N; i++)
+    {
+        int Len = 7 + (rand() % 56);
+
+        FuzzFillFrame(Buf, Len);
+
+        if (DrvSerialSend(pDrv, Buf, Len) == 0)
+        {
+            Sent++;
+        }
+
+        if ((i % 200) == 199)
+        {
+            usleep(20000);
+
+            StressFlush(pDrv);
+        }
+    }
+
+    return Sent;
+}
+
+/**
+ * @brief 高频连发: 200帧查询不等应答连灌, 之后收剩余应答统计
+ */
+static void StressBurst(DrvSerial_S *pDrv, int *pRecvCnt, int *pSent)
+{
+    unsigned char Req[16];
+
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int ReqLen = HexBuildReq(HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                             HEX_OP_QUERY, NULL, 0, Req);
+
+    int i;
+
+    StressFlush(pDrv);
+
+    for (i = 0; i < HEX_STRESS_BURST_N; i++)
+    {
+        if (DrvSerialSend(pDrv, Req, ReqLen) == 0)
+        {
+            (*pSent)++;
+        }
+    }
+
+    usleep(50000);
+
+    while (HexRecvFrame(pDrv, HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                        0, 0, Frame, 500) > 0)
+    {
+        (*pRecvCnt)++;
+    }
+
+    printf("       连发%d帧, 收到应答%d帧\n", *pSent, *pRecvCnt);
+}
+
+/**
+ * @brief 垃圾前缀重同步: 随机垃圾1~16字节+合法版本查询一起发
+ *
+ * @return 应答成功轮数
+ */
+/**
+ * @brief 单轮垃圾+查询: 构造发送并收应答
+ *
+ * @return 1=收到应答 0=未收到
+ */
+static int GarbageOneRound(DrvSerial_S *pDrv, const unsigned char *pReq, int ReqLen,
+                           unsigned char *pFrame)
+{
+    unsigned char Buf[16 + HEX_FRAME_MAX];
+
+    int Gn = 1 + (rand() % 16);
+
+    int j;
+
+    for (j = 0; j < Gn; j++)
+    {
+        Buf[j] = (unsigned char)(rand() & 0xFF);
+    }
+
+    memcpy(&Buf[Gn], pReq, ReqLen);
+
+    StressFlush(pDrv);
+
+    if (DrvSerialSend(pDrv, Buf, Gn + ReqLen) != 0)
+    {
+        return 0;
+    }
+
+    return (HexRecvFrame(pDrv, HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                         0, 0, pFrame, 300) > 0) ? 1 : 0;
+}
+
+static int StressGarbage(DrvSerial_S *pDrv, const unsigned char *pReq, int ReqLen)
+{
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int i;
+
+    int OkCnt = 0;
+
+    for (i = 0; i < HEX_STRESS_GARBAGE_N; i++)
+    {
+        OkCnt += GarbageOneRound(pDrv, pReq, ReqLen, Frame);
+
+        usleep(20000);
+    }
+
+    return OkCnt;
+}
+
+/**
+ * @brief 截断帧恢复: 合法帧只发一半, 随后连发完整查询验证恢复
+ *
+ * @return 恢复成功轮数
+ */
+/**
+ * @brief 单轮截断+恢复: 发截断帧, 连发完整查询直到恢复
+ *
+ * @return 1=恢复 0=未恢复
+ */
+static int TruncOneRound(DrvSerial_S *pDrv, const unsigned char *pReq, int ReqLen,
+                         unsigned char *pFrame, int TruncLen)
+{
+    int j;
+
+    StressFlush(pDrv);
+
+    DrvSerialSend(pDrv, pReq, TruncLen);
+
+    usleep(100000);
+
+    for (j = 0; j < 5; j++) /* 错位恢复可能需多次查询 */
+    {
+        DrvSerialSend(pDrv, pReq, ReqLen);
+
+        if (HexRecvFrame(pDrv, HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                         0, 0, pFrame, 200) > 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int StressTruncate(DrvSerial_S *pDrv, const unsigned char *pReq, int ReqLen)
+{
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int i;
+
+    int OkCnt = 0;
+
+    for (i = 0; i < HEX_STRESS_TRUNC_N; i++)
+    {
+        int TruncLen = ((i & 1) != 0) ? 7 : 5; /* 轮换停在CRC域前/Len域前 */
+
+        OkCnt += TruncOneRound(pDrv, pReq, ReqLen, Frame, TruncLen);
+    }
+
+    return OkCnt;
+}
+
+/**
+ * @brief 异常补充: CRC低字节错/未知CMD, 预期无应答
+ *
+ * @return 1=全部符合预期 0=出现意外应答
+ */
+/**
+ * @brief 单条无效应答验证: 发送后限时等待
+ *
+ * @return 1=无应答(符合预期) 0=收到意外应答
+ */
+static int NoAnsOne(DrvSerial_S *pDrv, unsigned char Cmd, const unsigned char *pReq,
+                    int ReqLen, unsigned char *pFrame)
+{
+    StressFlush(pDrv);
+
+    if (DrvSerialSend(pDrv, pReq, ReqLen) != 0)
+    {
+        return 0;
+    }
+
+    return (HexRecvFrame(pDrv, Cmd, HEX_ID_L(HEX_ID_VERSION), 0, 0, pFrame, 400) > 0) ? 0 : 1;
+}
+
+static int StressNoAns(DrvSerial_S *pDrv)
+{
+    unsigned char Req[HEX_FRAME_MAX];
+
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int ReqLen = HexBuildReq(HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                             HEX_OP_QUERY, NULL, 0, Req);
+
+    int Ok1, Ok2;
+
+    Req[ReqLen - 1] ^= 0x01; /* CRC末字节翻转(小端高字节), 固件CRC失败静默 */
+
+    Ok1 = NoAnsOne(pDrv, HEX_ID_H(HEX_ID_VERSION), Req, ReqLen, Frame);
+
+    Req[2] = 0x09; /* 未知CMD, 固件分发表无0x09静默 */
+
+    Ok2 = NoAnsOne(pDrv, 0x09, Req, ReqLen, Frame);
+
+    return (Ok1 == 1 && Ok2 == 1) ? 1 : 0;
+}
+
+/**
+ * @brief 压力项组1: 无效应答/高频连发/垃圾重同步/截断恢复(逐项探活+报告)
+ */
+static void StressRunSync(DrvSerial_S *pDrv)
+{
+    unsigned char Req[16];
+
+    int ReqLen = HexBuildReq(HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION),
+                             HEX_OP_QUERY, NULL, 0, Req);
+
+    int Sent = 0, RecvCnt = 0, GarbageOk, TruncOk, NoAnsOk;
+
+    NoAnsOk = StressNoAns(pDrv);
+
+    StressCheckAlive(pDrv, "无效应答静默(CRC低字节错/未知CMD)",
+                     NoAnsOk, NoAnsOk ? "无意外应答" : "收到意外应答");
+
+    StressBurst(pDrv, &RecvCnt, &Sent);
+
+    StressCheckAlive(pDrv, "高频连发", RecvCnt >= 1, "连发后收应答");
+
+    GarbageOk = StressGarbage(pDrv, Req, ReqLen);
+
+    StressCheckAlive(pDrv, "垃圾前缀重同步",
+                     GarbageOk >= (HEX_STRESS_GARBAGE_N * 9) / 10, "应答率");
+
+    printf("       %d轮中恢复应答%d轮\n", HEX_STRESS_GARBAGE_N, GarbageOk);
+
+    TruncOk = StressTruncate(pDrv, Req, ReqLen);
+
+    StressCheckAlive(pDrv, "截断帧恢复", TruncOk == HEX_STRESS_TRUNC_N, "恢复率");
+
+    printf("       %d轮中恢复%d轮\n", HEX_STRESS_TRUNC_N, TruncOk);
+}
+
+/**
+ * @brief 依次执行全部压力项并打印汇总
+ */
+static void StressRunAll(DrvSerial_S *pDrv)
+{
+    int Sent;
+
+    StressRunSync(pDrv);
+
+    Sent = StressFuzz(pDrv);
+
+    StressCheckAlive(pDrv, "fuzz随机帧轰炸", 1, "轰炸后");
+
+    printf("       发送%d帧\n", Sent);
+
+    printf("===== 压力测试汇总: PASS %d / FAIL %d =====\n", G_StressPass, G_StressFail);
+}
+
+/**
+ * @brief HEX压力/暴力验证入口(功能3模式2)
+ *
+ * @return 0=全部通过 1=存在失败 -1=串口打开失败
+ */
+int BspHexStressRun(const char *pDev, int Baud)
+{
+    DrvSerial_S Serial;
+
+    HexFillArgs(&Serial, pDev, Baud);
+
+    InstallSignal(SIGINT);
+
+    InstallSignal(SIGTERM);
+
+    printf("===== HEX压力/暴力验证器 (设备 %s @%d) =====\n", Serial.Dev, Serial.Baud);
+
+    if (HexOpenDevice(&Serial) != 0)
+    {
+        return -1;
+    }
+
+    StressRunAll(&Serial);
+
+    DrvSerialClose(&Serial);
+
+    return (G_StressFail > 0) ? 1 : 0;
+}
+
+/**
+ * @brief 用例验证模式执行(安全/风险/异常组)
+ */
+static int HexRunTestMode(const char *pDev, int Baud, int RunRisk)
 {
     DrvSerial_S Serial;
 
@@ -2260,7 +2720,10 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
 
     InstallSignal(SIGTERM);
 
-    if (HexOpenDevice(&Serial, RunRisk) != 0)
+    printf("===== HEX协议验证器 V1.6.9 (设备 %s @%d, %s) =====\n",
+           Serial.Dev, Serial.Baud, RunRisk ? "安全+风险+异常组" : "仅安全组");
+
+    if (HexOpenDevice(&Serial) != 0)
     {
         return -1;
     }
@@ -2274,4 +2737,19 @@ int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
     HexPrintFails();
 
     return (FailNum > 0) ? 1 : 0;
+}
+
+/**
+ * @brief HEX验证入口: 0=仅安全组 1=全量(安全+风险+异常) 2=压力/暴力
+ *
+ * @return 0=全部通过 1=存在失败 -1=串口打开失败
+ */
+int BspHexTestRun(const char *pDev, int Baud, int RunRisk)
+{
+    if (RunRisk == 2)
+    {
+        return BspHexStressRun(pDev, Baud);
+    }
+
+    return HexRunTestMode(pDev, Baud, RunRisk);
 }

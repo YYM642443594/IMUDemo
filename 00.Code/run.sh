@@ -128,8 +128,10 @@ case "$CHOICE" in
         ;;
     3)
         echo ""
-        echo "HEX验证模式: 0=仅安全组(查询+无副作用动作) 1=安全组+风险组(写RAM自动还原)"
-        printf "模式 [0/1, 回车=0]: "
+        echo "HEX验证模式: 0=仅安全组(查询+无副作用动作)"
+        echo "             1=安全组+风险组+异常组(写RAM自动还原, 非法输入鲁棒性)"
+        echo "             2=压力/暴力测试(fuzz轰炸/截断恢复/垃圾重同步/高频连发)"
+        printf "模式 [0/1/2, 回车=0]: "
         read -r MODE
         MODE="${MODE:-0}"
         echo "== Run: imu_test 功能3(HEX) $DEV $BAUD 模式$MODE =="
