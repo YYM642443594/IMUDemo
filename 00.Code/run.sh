@@ -3,16 +3,17 @@
 # 一键编译并运行 CAN 验证工具 (can_stat)
 #
 # 用法:
-#     ./run.sh                     # 默认 can0, 数据流统计, 直到 Ctrl+C
-#     ./run.sh can0 10             # 数据流统计, 运行10秒自动汇总退出
-#     ./run.sh can0 test           # CAN指令验证(仅安全组: 查询+YAW归零)
-#     ./run.sh can0 test 1         # CAN指令验证(安全组+风险组: RAM写入+自动还原)
+#     ./run.sh                     # 菜单交互选择功能
+#     ./run.sh can0                # 菜单交互(指定接口)
+#     ./run.sh can0 10             # 数据流统计10秒, 免菜单
+#     ./run.sh can0 test [1]       # CAN指令验证, 免菜单
 #     ./run.sh -h                  # 显示帮助
 #
 # 说明:
 #     1.使用gcc编译全部源文件生成can_stat
 #     2.检查CAN接口存在且UP(未UP时尝试sudo拉起)
-#     3.编译成功后自动运行程序, Ctrl+C退出并打印汇总
+#     3.命令行未指定模式时进入功能菜单,
+#       交互时不确定直接回车, 一律取安全默认值
 #=============================================================
 
 # 切换到脚本所在目录, 保证在任意位置执行均可找到源码
@@ -27,7 +28,8 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
 --------------------------------------------
  CAN接口    默认 can0  (查看: ip -br link | grep -i can)
  模式与参数:
-   (空)/秒数   数据流统计, 秒数默认0=直到Ctrl-C
+   (空)         功能菜单交互选择(回车取安全默认值)
+   秒数         数据流统计, 秒数默认0=直到Ctrl-C
    test [0/1]  CAN指令验证, 0=仅安全组(默认) 1=含风险组(写入后自动还原)
  详细帮助    ./can_stat -h
  免菜单直跑  ./can_stat can0 2 1
@@ -44,20 +46,30 @@ fi
 # CAN接口名: 取第1个参数, 未传时默认can0
 CAN_DEV=${1:-can0}
 
-# 功能与参数: 第2个参数"test"=CAN指令验证(第3个参数0/1=风险组), 其余=持续秒数
-MODE="stat"
-DURATION=${2:-0}
+# 模式: 第2参数"test"=CAN指令验证, 数字=统计秒数, 空=交互菜单
+MODE=""
+DURATION=0
 RISK=0
 if [ "$2" = "test" ]; then
     MODE="test"
-    DURATION=""
     RISK=${3:-0}
+elif [ -n "$2" ]; then
+    MODE="stat"
+    DURATION=$2
 fi
 
-echo "===================================="
-echo " 编译 CAN 验证工具"
-echo "===================================="
+echo "============================================================"
+echo " IMU Linux CAN 验证工具 (run.sh)"
+echo "------------------------------------------------------------"
+echo " CAN接口   默认 can0  (查看: ip -br link | grep -i can)"
+echo " 功能菜单  1=数据流统计  2=CAN指令验证"
+echo "           交互时不确定直接回车, 一律取安全默认值"
+echo " 详细帮助  ./run.sh -h   免菜单直跑 ./can_stat can0 2 1"
+echo "------------------------------------------------------------"
+echo " 本次参数: 接口=$CAN_DEV  模式=$([ -n "$MODE" ] && echo "$MODE" || echo "菜单选择")"
+echo "============================================================"
 
+echo "== Build =="
 gcc -O2 -Wall -o can_stat main.c drv_socketcan.c bsp_can_queue.c bsp_can_protocol.c bsp_can_test.c -lpthread
 
 if [ $? -ne 0 ]; then
@@ -65,8 +77,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "编译成功: ./can_stat"
-echo ""
+echo "Build OK (can_stat: 1=数据流统计 2=CAN指令验证)"
 
 # 接口存在性检查
 if ! ip link show "$CAN_DEV" &>/dev/null; then
@@ -81,16 +92,35 @@ if ! ip link show "$CAN_DEV" | grep -q "state UP"; then
     sudo ip link set "$CAN_DEV" up
 fi
 
+# 功能菜单: 命令行未指定模式时交互选择(直接回车取安全默认值)
+if [ -z "$MODE" ]; then
+    echo ""
+    echo "请选择功能: 1=数据流统计(默认)  2=CAN指令验证"
+    read -p "选择[1/2, 回车=1]: " CHOICE
+    case "$CHOICE" in
+        2) MODE="test" ;;
+        *) MODE="stat" ;;
+    esac
+fi
+
 if [ "$MODE" = "test" ]; then
-    echo "===================================="
-    echo " 运行 can_stat CAN指令验证 (接口: $CAN_DEV, 风险组: $RISK)"
-    echo "===================================="
+    if [ "$2" != "test" ]; then
+        read -p "风险组[0=仅安全组, 1=含风险组(写入后自动还原), 回车=0]: " R
+        [ -n "$R" ] && RISK=$R
+    fi
+    echo "============================================================"
+    echo " 运行 CAN指令验证 (接口: $CAN_DEV, 风险组: $RISK)"
+    echo "============================================================"
     exec ./can_stat "$CAN_DEV" 2 "$RISK"
 fi
 
-echo "===================================="
-echo " 运行 can_stat 数据流统计 (接口: $CAN_DEV, 时长: ${DURATION}s)"
-echo " 按 Ctrl+C 退出并打印汇总"
-echo "===================================="
+if [ "$2" != "test" ] && [ -z "$2" ]; then
+    read -p "持续秒数[0=直到Ctrl-C, 回车=0]: " D
+    [ -n "$D" ] && DURATION=$D
+fi
 
+echo "============================================================"
+echo " 运行 数据流统计 (接口: $CAN_DEV, 时长: ${DURATION}s)"
+echo " 按 Ctrl+C 退出并打印汇总"
+echo "============================================================"
 exec ./can_stat "$CAN_DEV" "$DURATION"
