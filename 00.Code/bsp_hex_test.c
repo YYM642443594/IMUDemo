@@ -2,8 +2,8 @@
  *******************************************************************************
  * @file    bsp_hex_test.c
  * @author  杨镒铭
- * @version V1.6.7
- * @date    2026-10-21
+ * @version V1.6.8
+ * @date    2026-10-22
  * @brief   志翔IMU HEX交互协议逐报文验证器(由main.c统一入口调用, 单程序整合版)
  *
  * @detail
@@ -15,6 +15,9 @@
  *   - 动作类: 下发写入帧 -> 应答DATA[0]==0x00即通过
  *   - 分组执行: 安全组(纯查询+无持久副作用动作)/风险组(写RAM改配置)
  *   - 风险组验证后自动还原: 依据安全组查询缓存构造还原帧(还原动作不计分)
+ *   - 异常组: 非法输入鲁棒性(与风险组同开关)——CRC错误/非法操作符/未知ID/
+ *     Len超限(固件静默无应答, 超时即通过)/非法值写入后行为查询(如频率档
+ *     回落/坐标系直写/PPS归零, 固件行为以bsp_parse.c为准), 还原走外层统一执行
  *   - 接收与数据流混流容错: 滑窗搜索帧头+CMD/ID匹配+CRC校验, 剔除推送报文噪声
  *   - 输出为安静模式: 每条用例一行, 结束后输出汇总表
  *   - 代码风格: 单函数体不超过30行(约20行为宜), 超出即按职责拆分
@@ -32,6 +35,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.6.8<td>2026-10-22<td>杨镒铭<td>新增异常组9条(与风险组同开关, 总32条): 0x0008磁力计校准固件0x00分发表未实现(文档3.2.2有, 真机3.0.0.5实测静默, 自风险组转异常组预期无应答)+CRC错误帧/非法操作符/未知ID/Len超限静默无应答+频率非法操作符无效应答(DATA[0]=0)+非法值写入->行为查询3条(频率档回落5/坐标系837直写/PPS模式归零, 依固件bsp_parse.c行为), ABN_WQ还原外层统一执行; 删无引用HX_R_MAG_OFF
  * <tr><td>V1.6.7<td>2026-10-21<td>杨镒铭<td>消构建告警: MarkVals拼接改足量中间缓冲+限长memcpy拷回(替代二次snprintf), 免-Wformat-truncation, 截断保头行为不变
  * <tr><td>V1.6.6<td>2026-10-21<td>杨镒铭<td>函数长度规范重构(单函数≤30行): CheckQuery按校验键拆12个小函数+分发表, BuildSetData/RunRestore按类型拆构造函数, RunScaleQuery拆探测/诊断两阶段, 主流程拆单条执行/汇总/失败清单, TryExtractFrame/HexRecvFrame/RunCase等同步拆分, 行为不变
  * <tr><td>V1.6.5<td>2026-10-21<td>杨镒铭<td>参照固件bsp_parse.c封装方式重构可读性: 新增19个报文ID常量(HEX_ID_xxx, 对应固件RECV_ID_xxx_E)与帧字段命名访问宏(HEX_FR_CMD/ID/LEN, HEX_RESP_DATA/DATALEN/DATA0, HEX_REQ_DATA), 用例表与解析代码全部替换魔法数字/下标, 行为不变
@@ -123,15 +127,22 @@
 typedef enum
 {
     HX_T_QUERY = 0,   /* 查询类: 校验应答格式/值域 */
-    HX_T_ACTION       /* 动作类: 应答DATA[0]==0x00即过 */
+    HX_T_ACTION,      /* 动作类: 应答DATA[0]==0x00即过 */
+    HX_T_NOANS,       /* 异常类: 预期无应答(超时即通过) */
+    HX_T_ABN_WQ       /* 异常类: 非法值写入->行为查询 两步(还原由外层统一执行) */
 } HxCaseType_E;
 
 /** @brief 风险等级 */
 typedef enum
 {
     HX_G_SAFE = 0,    /* 安全组: 只读或无持久副作用 */
-    HX_G_RISK         /* 风险组: 写RAM改配置, 验证后自动还原 */
+    HX_G_RISK,        /* 风险组: 写RAM改配置, 验证后自动还原 */
+    HX_G_ABN          /* 异常组: 非法输入鲁棒性, 与风险组同开关 */
 } HxGroup_E;
+
+/** @brief 异常帧构造标志(AbnFlags位) */
+#define HEX_ABN_BADCRC  0x01    /* CRC字段故意写错(验固件CRC校验丢弃) */
+#define HEX_ABN_LENOVR  0x02    /* 只发帧头+Len=0x0100(验固件长度溢出丢弃) */
 
 /** @brief 设置值构造方式(风险组动态设置值) */
 typedef enum
@@ -156,7 +167,6 @@ typedef enum
     HX_R_PPS,         /* 还原原PPS开关+模式(缓存) */
     HX_R_COORD,       /* 还原原坐标系(缓存) */
     HX_R_MSG22_OFF,   /* 固定: 关0x0022推送 */
-    HX_R_MAG_OFF,     /* 固定: 关磁力计校准 */
     HX_R_ZERO_OFF     /* 固定: 清除零偏校准 */
 } HxRestoreKind_E;
 
@@ -175,6 +185,8 @@ typedef struct
     unsigned char DataLen;        /* 固定发送数据长度(0=无DATA域, 如0x03查询) */
     HxRestoreKind_E Restore;      /* 通过后的还原方式 */
     unsigned char ExpectLen;      /* 期望应答帧长(0=不限; >0时长度不符的匹配帧滑过, 防同ID推送帧混叠) */
+    unsigned char AbnFlags;       /* 异常帧构造标志(HEX_ABN_xxx) */
+    unsigned char QData[16];      /* ABN_WQ第二步查询DATA */
 } HxCase_S;
 
 /** @brief 单条用例执行结果 */
@@ -276,12 +288,36 @@ static HxCase_S G_Cases[] =
       "0x0012PPS开关取反(RAM)", NULL, HX_S_PPS_INV, {0}, 0, HX_R_PPS },
     { HEX_ID_H(HEX_ID_COORD), HEX_ID_L(HEX_ID_COORD), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
       "0x0015坐标系切换(RAM)", NULL, HX_S_COORD_ALT, {0}, 0, HX_R_COORD },
-    { HEX_ID_H(HEX_ID_MAG_CAL), HEX_ID_L(HEX_ID_MAG_CAL), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
-      "0x0008开磁力计校准", NULL, HX_S_FIXED, {0x01}, 1, HX_R_MAG_OFF },
     { HEX_ID_H(HEX_ID_ZERO_CAL), HEX_ID_L(HEX_ID_ZERO_CAL), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
       "0x0020开零偏校准(需静止)", NULL, HX_S_FIXED, {0x01, 0, 0, 0, 0, 0, 0, 0, 0}, 9, HX_R_ZERO_OFF },
     { HEX_ID_H(HEX_ID_DATETIME), HEX_ID_L(HEX_ID_DATETIME), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
       "0x0019时间同步主机时间", NULL, HX_S_TIME_NOW, {0}, 0, HX_R_NONE },
+
+    /* ---------- 异常组: 非法输入鲁棒性(与风险组同开关, 预期以固件实际行为为准) ---------- */
+    /* 文档3.2.2有0x0008磁力计校准, 但固件0x00分发表(bsp_parse.c)无此ID, 真机3.0.0.5实测静默 */
+    { HEX_ID_H(HEX_ID_MAG_CAL), HEX_ID_L(HEX_ID_MAG_CAL), HEX_OP_RAM, HX_T_NOANS, HX_G_ABN,
+      "0x0008磁力计校准(固件未实现)", NULL, HX_S_FIXED, {0x01}, 1, HX_R_NONE },
+    /* 无效应答静默类: 固件CRC校验失败/非法操作符/未知ID/Len溢出均无应答(超时即通过) */
+    { HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION), HEX_OP_QUERY, HX_T_NOANS, HX_G_ABN,
+      "CRC错误帧版本查询", NULL, HX_S_FIXED, {0}, 0, HX_R_NONE, 0, HEX_ABN_BADCRC },
+    { HEX_ID_H(HEX_ID_VERSION), HEX_ID_L(HEX_ID_VERSION), 0x01, HX_T_NOANS, HX_G_ABN,
+      "版本查询非法操作符", NULL, HX_S_FIXED, {0}, 0, HX_R_NONE },
+    { 0x00, 0x23, HEX_OP_QUERY, HX_T_NOANS, HX_G_ABN,
+      "未知报文ID(0x0023)查询", NULL, HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    { 0x00, 0x04, HEX_OP_QUERY, HX_T_NOANS, HX_G_ABN,
+      "Len超限(0x0100)帧", NULL, HX_S_FIXED, {0}, 0, HX_R_NONE, 0, HEX_ABN_LENOVR },
+    /* 无效操作符无效应答类: 固件0x04末尾无条件应答, 非法操作符回DATA[0]=0 */
+    { HEX_ID_H(HEX_ID_PUSH_FRE), HEX_ID_L(HEX_ID_PUSH_FRE), 0x03, HX_T_ACTION, HX_G_ABN,
+      "频率非法操作符无效应答", NULL, HX_S_FIXED, {0x00}, 1, HX_R_NONE },
+    /* 非法值写入->固件行为查询 两步(QData=查询DATA, 还原走Restore缓存) */
+    { HEX_ID_H(HEX_ID_PUSH_FRE), HEX_ID_L(HEX_ID_PUSH_FRE), HEX_OP_RAM, HX_T_ABN_WQ, HX_G_ABN,
+      "非法频率档(0x0A)回落验证", "freqfb", HX_S_FIXED, {0x0A}, 1, HX_R_FREQ, 0, 0, {0x00} },
+    { HEX_ID_H(HEX_ID_COORD), HEX_ID_L(HEX_ID_COORD), HEX_OP_RAM, HX_T_ABN_WQ, HX_G_ABN,
+      "非法坐标系(837)直写确认", "coordraw", HX_S_FIXED,
+      {0x45, 0x03, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_COORD, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0} },
+    { HEX_ID_H(HEX_ID_PPS), HEX_ID_L(HEX_ID_PPS), HEX_OP_RAM, HX_T_ABN_WQ, HX_G_ABN,
+      "非法PPS模式(5)归零确认", "ppszero", HX_S_FIXED,
+      {0x00, 0x05, 0, 0, 0, 0, 0, 0, 0, 0}, 10, HX_R_PPS, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0} },
 
     /* 复位重启: 会断流数秒, 固定放用例表末尾最后执行 */
     { HEX_ID_H(HEX_ID_RESET), HEX_ID_L(HEX_ID_RESET), HEX_OP_RAM, HX_T_ACTION, HX_G_RISK,
@@ -1071,6 +1107,75 @@ static int CkByte(const char *Key, const unsigned char *pD, int DataN,
     return 1;
 }
 
+/** @brief 异常: 非法频率档(0x0A)写入后固件回落50Hz档5(BspDataPushFreCodeToEnum非法码回落) */
+static int CkFreqFb(const char *Key, const unsigned char *pD, int DataN,
+                    char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    (void)Key;
+
+    if (DataN < 1)
+    {
+        return NeedMore(pNote, NoteSize, 1);
+    }
+
+    if (pD[0] != 5)
+    {
+        snprintf(pNote, (size_t)NoteSize, "非法档后固件回档%u(预期回落5=50Hz)", pD[0]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "非法档0x0A回落档5(50Hz), 符合固件约定");
+
+    return 1;
+}
+
+/** @brief 异常: 非法坐标系837写入后固件无值域校验直写(记录行为, 未来加校验则FAIL提示) */
+static int CkCoordRaw(const char *Key, const unsigned char *pD, int DataN,
+                      char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    (void)Key;
+
+    if (DataN < 2)
+    {
+        return NeedMore(pNote, NoteSize, 2);
+    }
+
+    if (GetU16(pD) != 837)
+    {
+        snprintf(pNote, (size_t)NoteSize, "固件已拦截非法值(回%u, 原837直写)", GetU16(pD));
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "固件未拦截直写837(无值域校验), 已还原");
+
+    return 1;
+}
+
+/** @brief 异常: 非法PPS模式5写入后固件归零(Buf[8]非1/2置模式0, 与CAN侧直写不同) */
+static int CkPpsZero(const char *Key, const unsigned char *pD, int DataN,
+                     char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    (void)Key;
+
+    if (DataN < 2)
+    {
+        return NeedMore(pNote, NoteSize, 2);
+    }
+
+    if (pD[1] != 0)
+    {
+        snprintf(pNote, (size_t)NoteSize, "非法模式后固件回%u(预期归0)", pD[1]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "非法模式5归0(固件非1/2置0), 已还原");
+
+    return 1;
+}
+
 /** @brief 校验键->校验函数分发表 */
 typedef int (*HxCheck_Fn)(const char *Key, const unsigned char *pD, int DataN,
                           char *pVals, int ValsSize, char *pNote, int NoteSize);
@@ -1095,6 +1200,9 @@ static const struct
     { "batt",     CkByte   },
     { "accscale", CkScale  },
     { "gyroscale", CkScale },
+    { "freqfb",   CkFreqFb },
+    { "coordraw", CkCoordRaw },
+    { "ppszero",  CkPpsZero },
 };
 
 /**
@@ -1372,13 +1480,6 @@ static int HexRestoreData3(HxRestoreKind_E Kind, unsigned char *pData, unsigned 
 {
     switch (Kind)
     {
-        case HX_R_MAG_OFF:
-            pData[0] = 0x00;
-
-            *pDataLen = 1;
-
-            break;
-
         case HX_R_ZERO_OFF:
             pData[0] = 0x00;
 
@@ -1450,6 +1551,138 @@ static int RunRestore(DrvSerial_S *pDrv, const HxCase_S *pC)
     }
 
     return (HEX_RESP_DATA0(Frame) == 0x00) ? 1 : 0; /* 应答DATA[0]==0x00视为还原成功 */
+}
+
+/*===========================================================
+=               异常组执行(静默类/写查两步类)
+===========================================================*/
+
+/**
+ * @brief 构造并发送异常帧(按AbnFlags: CRC写错/长度溢出/正常帧)
+ *
+ * @return 发送字节数 -1=失败
+ */
+static int AbnBuildSend(DrvSerial_S *pDrv, const HxCase_S *pC)
+{
+    unsigned char Req[HEX_FRAME_MAX];
+
+    int ReqLen;
+
+    tcflush(pDrv->Fd, TCIOFLUSH);
+
+    G_RxLen = 0;
+
+    if ((pC->AbnFlags & HEX_ABN_LENOVR) != 0)
+    {
+        Req[0] = 0xAA; Req[1] = 0x55; Req[2] = pC->Cmd; Req[3] = pC->Id;
+        Req[4] = pC->Op; Req[5] = 0x00; Req[6] = 0x01; /* Len=0x0100触发溢出丢弃 */
+
+        return (DrvSerialSend(pDrv, Req, 7) == 0) ? 7 : -1;
+    }
+
+    ReqLen = HexBuildReq(pC->Cmd, pC->Id, pC->Op, pC->Data, pC->DataLen, Req);
+
+    if ((pC->AbnFlags & HEX_ABN_BADCRC) != 0)
+    {
+        Req[ReqLen - 1] ^= 0xFF; /* CRC高字节故意写错 */
+    }
+
+    return (DrvSerialSend(pDrv, Req, ReqLen) == 0) ? ReqLen : -1;
+}
+
+/**
+ * @brief 异常用例: 预期无应答(固件静默丢弃无效输入, 超时即通过)
+ */
+static void RunNoAnsCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
+{
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    if (AbnBuildSend(pDrv, pC) < 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "发送失败");
+
+        return;
+    }
+
+    if (HexRecvFrame(pDrv, pC->Cmd, pC->Id, 0, 0, Frame, HEX_RESP_TIMEOUT_MS) > 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "收到意外应答(固件未丢弃)");
+
+        return;
+    }
+
+    pRes->Pass = 1;
+
+    snprintf(pRes->Vals, sizeof(pRes->Vals), "无应答(符合固件预期)");
+}
+
+/** @brief ABN_WQ第一步: 写非法值, 固件应答DATA[0]==0 */
+static int AbnWqWrite(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+{
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int n = HexTransact(pDrv, pC->Cmd, pC->Id, pC->Op, pC->Data, pC->DataLen, 0, 0, Frame);
+
+    if (n <= 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note),
+                 (n == -1) ? "写入发送失败" : "写入无应答");
+
+        return 0;
+    }
+
+    if ((HEX_RESP_DATALEN(Frame) < 1) || (HEX_RESP_DATA0(Frame) != 0x00))
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "写入应答码非0x00");
+
+        return 0;
+    }
+
+    return 1;
+}
+
+/** @brief ABN_WQ第二步查询帧DATA长度(按ID: 与正例查询格式一致) */
+static unsigned char AbnQLen(unsigned char Id)
+{
+    if (Id == HEX_ID_L(HEX_ID_COORD)) { return 10; }
+
+    if (Id == HEX_ID_L(HEX_ID_PPS)) { return 10; }
+
+    return 1; /* 0x0004频率 */
+}
+
+/** @brief ABN_WQ第二步: 查询固件行为, 按Expect键校验 */
+static int AbnWqQuery(DrvSerial_S *pDrv, const HxCase_S *pC, HxResult_S *pRes)
+{
+    unsigned char Frame[HEX_FRAME_MAX];
+
+    int n = HexTransact(pDrv, pC->Cmd, pC->Id, HEX_OP_QUERY, pC->QData,
+                        AbnQLen(pC->Id), 0, 0, Frame);
+
+    if (n <= 0)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "行为查询无应答");
+
+        return 0;
+    }
+
+    pRes->Pass = CheckQuery(pC, Frame, n, pRes->Vals, (int)sizeof(pRes->Vals),
+                            pRes->Note, (int)sizeof(pRes->Note));
+
+    return pRes->Pass;
+}
+
+/**
+ * @brief 异常用例: 非法值写入->固件行为查询 两步(还原由外层统一执行)
+ */
+static void RunAbnWqCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
+{
+    if (AbnWqWrite(pDrv, pC, pRes) == 0)
+    {
+        return;
+    }
+
+    (void)AbnWqQuery(pDrv, pC, pRes);
 }
 
 /*===========================================================
@@ -1702,6 +1935,10 @@ static void RunCase(DrvSerial_S *pDrv, HxCase_S *pC, HxResult_S *pRes)
 
     pRes->Done = 1;
 
+    if (pC->Type == HX_T_ABN_WQ) { RunAbnWqCase(pDrv, pC, pRes); return; }
+
+    if (pC->Type == HX_T_NOANS) { RunNoAnsCase(pDrv, pC, pRes); return; }
+
     if (pC->SetKind == HX_S_SCALE_Q)
     {
         RunScaleQuery(pDrv, pC, pRes);
@@ -1751,8 +1988,8 @@ static const char *HexSummaryInfo(unsigned int i, int RunRisk)
 
     if (pRes->Skip != 0)
     {
-        return ((G_Cases[i].Group == HX_G_RISK) && (RunRisk == 0))
-               ? "风险组未启用" : pRes->Note;
+        return ((G_Cases[i].Group != HX_G_SAFE) && (RunRisk == 0))
+               ? "风险/异常组未启用" : pRes->Note;
     }
 
     if (pRes->Done == 0)
@@ -1834,13 +2071,13 @@ static void HexRunOneCase(DrvSerial_S *pDrv, unsigned int i, int RunRisk)
 {
     HxCase_S *pCase = &G_Cases[i];
 
-    if ((pCase->Group == HX_G_RISK) && (RunRisk == 0))
+    if ((pCase->Group != HX_G_SAFE) && (RunRisk == 0))
     {
         G_Result[i].Skip = 1;
 
         PrintCaseHead(i, pCase->Name);
 
-        printf("SKIP  风险组未启用\n");
+        printf("SKIP  风险/异常组未启用\n");
 
         return;
     }
@@ -1855,7 +2092,11 @@ static void HexRunOneCase(DrvSerial_S *pDrv, unsigned int i, int RunRisk)
 
     PrintCaseResult(pCase, &G_Result[i]);
 
-    if (NeedRestore(pCase, &G_Result[i]) != 0)
+    if (pCase->Type == HX_T_ABN_WQ)
+    {
+        HexDoRestorePrint(pDrv, pCase); /* 异常写查后无条件还原, 保设备状态 */
+    }
+    else if (NeedRestore(pCase, &G_Result[i]) != 0)
     {
         HexDoRestorePrint(pDrv, pCase);
     }
@@ -1988,8 +2229,8 @@ static void HexFillArgs(DrvSerial_S *pSerial, const char *pDev, int Baud)
  */
 static int HexOpenDevice(DrvSerial_S *pSerial, int RunRisk)
 {
-    printf("===== HEX协议验证器 V1.6.6 (设备 %s @%d, %s) =====\n",
-           pSerial->Dev, pSerial->Baud, RunRisk ? "安全组+风险组" : "仅安全组");
+    printf("===== HEX协议验证器 V1.6.8 (设备 %s @%d, %s) =====\n",
+           pSerial->Dev, pSerial->Baud, RunRisk ? "安全+风险+异常组" : "仅安全组");
 
     if (DrvSerialOpen(pSerial) != 0)
     {
