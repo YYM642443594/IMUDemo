@@ -144,6 +144,26 @@ static double NowSec(void)
     return (double)Ts.tv_sec + (double)Ts.tv_nsec * 1e-9;
 }
 
+/**
+ * @brief 打印用法帮助(-h/--help或无参数时)
+ */
+static void PrintUsage(const char *pProg)
+{
+    printf("Usage:\r\n");
+    printf("    %s can0 [持续秒数]   功能1: 数据流统计(0或省略=直到Ctrl-C)\r\n", pProg);
+    printf("    %s can0 2 [0/1]      功能2: CAN指令验证(0=仅安全组, 1=含风险组)\r\n", pProg);
+    printf("    %s -h                显示本帮助\r\n", pProg);
+    printf("功能说明:\r\n");
+    printf("    1 数据流统计: 0x091~0x098帧率/帧间隔/时间戳Δt统计与实时解析,\r\n");
+    printf("                  按需自动下发0x103开启推送(数据正常时永不发送)\r\n");
+    printf("    2 CAN指令验证: 0x100~0x115逐指令实测, 查询值域校验,\r\n");
+    printf("                  风险组RAM写入验证后自动还原(还原不计分)\r\n");
+    printf("CAN接口前置配置(波特率需与IMU一致, 协议默认1000K):\r\n");
+    printf("    sudo ip link set can0 down\r\n");
+    printf("    sudo ip link set can0 type can bitrate 1000000\r\n");
+    printf("    sudo ip link set can0 up\r\n");
+}
+
 /*===========================================================
 =                       CAN接收线程
 =  职责: 阻塞式收取CAN帧并原样入队, 不做任何解析
@@ -250,12 +270,19 @@ int main(int argc, char *argv[])
     printf(" Linux SocketCAN CANStat Start\r\n");
     printf("====================================\r\n");
 
+    /* 帮助: -h/--help 打印详细用法后退出 */
+    if ((argc > 1) && ((strcmp(argv[1], "-h") == 0) || (strcmp(argv[1], "--help") == 0)))
+    {
+        PrintUsage(argv[0]);
+
+        return 0;
+    }
+
     /* 参数检查: 第1个参数为CAN接口名, 第2个可选持续秒数或功能号 */
     if (argc < 2)
     {
-        printf("Usage:\r\n");
-        printf("    %s can0 [持续秒数(0=直到Ctrl-C)]\r\n", argv[0]);
-        printf("    %s can0 2 [0/1]  CAN指令验证(0=仅安全组, 1=含风险组)\r\n", argv[0]);
+        PrintUsage(argv[0]);
+
         return -1;
     }
 
