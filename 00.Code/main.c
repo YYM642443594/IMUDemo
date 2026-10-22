@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    main.c
  * @author  杨镒铭
- * @version V1.7.5
+ * @version V1.7.7
  * @date    2026-10-21
  * @brief   Linux串口IMU验证工具统一入口(UART版: 数据流统计/AT指令/HEX协议)
  *
@@ -16,6 +16,7 @@
  *   - 功能3: HEX交互协议逐报文验证(bsp_hex_test, 依据协议文档3.2章)
  *   CRC16校验(初值0x3692, 多项式0x8408反向), 只统计校验通过的帧.
  *   终端下功能1每秒原地刷新.
+ *   代码风格: 单函数体不超过30行(约20行为宜), 超出即按职责拆分.
  *
  * @arch
  *   main(入口分发+统计显示) ── bsp_uart_protocol(帧同步/CRC/统计/解析)
@@ -34,6 +35,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.7.7<td>2026-10-21<td>杨镒铭<td>函数长度规范重构: main拆功能分发/统计初始化/收尾/周期打印/单轮接收, 各函数≤30行, 行为不变
  * <tr><td>V1.7.5<td>2026-10-21<td>杨镒铭<td>固件量程应答已对齐文档(PayLoad 16改10): hex_test 0x22期望帧长24改回18直接命中, 宽容阶段保留兼容旧固件24字节
  * <tr><td>V1.7.4<td>2026-10-21<td>杨镒铭<td>0x22量程查询定因修复: 查固件工程(bsp_parse.c L1752)确认应答PayLoad=16/整帧24字节, 与文档回复表(18)不符; ExpectLen按固件实际改24, 宽容阶段保留兼容文档式18
  * <tr><td>V1.7.3<td>2026-10-21<td>杨镒铭<td>0x22量程查询加诊断收包: 3格式探测后不限应答长度宽容收包(跳过数据包4推送帧), 档位白名单判定, 解析失败打印原始帧hex, 全无应答明确提示固件串口0x22查询疑未实现
@@ -71,7 +73,7 @@
 ===========================================================*/
 
 /** @brief 程序版本号, 启动时打印 */
-static const char *G_Version = "V1.7.5";
+static const char *G_Version = "V1.7.6";
 
 /** @brief 串口驱动控制块 */
 static DrvSerial_S G_Serial = { .Fd = -1, .Dev = "/dev/ttyUSB0", .Baud = 921600 };
@@ -124,12 +126,47 @@ static double NowSec(void)
 =                       串口接收线程
 =  职责: 阻塞式收取串口字节并入队, 不做任何解析
 ===========================================================*/
+
+/**
+ * @brief 收到的一批字节全部入队(队列满时Push内部丢弃并计DropCount)
+ */
+static void QueuePushBytes(const unsigned char *pBuf, int n)
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+    {
+        BspUartQueuePush(&G_Queue, pBuf[i]);
+    }
+}
+
+/**
+ * @brief 单轮接收: 收到字节入队并更新统计
+ *
+ * @return 1=收到数据 0=无数据/错误(由调用方决定重试或退出)
+ */
+static int RecvOneRound(unsigned char *pBuf)
+{
+    int n = DrvSerialRecv(&G_Serial, pBuf, 512);
+
+    if (n <= 0)
+    {
+        return 0;
+    }
+
+    G_LastRxSec = NowSec();
+
+    G_RxBytes += (unsigned long long)n;
+
+    QueuePushBytes(pBuf, n);
+
+    return 1;
+}
+
 static void *
 UartRecvThread(void *arg)
 {
     unsigned char Buf[512];
-
-    int n;
 
     (void)arg;
 
@@ -138,9 +175,7 @@ UartRecvThread(void *arg)
     while (G_Running)
     {
         /* 阻塞式读: 收到>=1字节即返回(VMIN=1), USB串口一次常带一包字节 */
-        n = DrvSerialRecv(&G_Serial, Buf, (int)sizeof(Buf));
-
-        if (n <= 0)
+        if (RecvOneRound(Buf) == 0)
         {
             /* 错误或被信号打断: 运行中则休眠100ms重试, 退出中则结束 */
             if (G_Running)
@@ -151,20 +186,6 @@ UartRecvThread(void *arg)
             }
 
             break;
-        }
-
-        G_LastRxSec = NowSec();
-
-        G_RxBytes += (unsigned long long)n;
-
-        /* 字节入队, 队列满时Push内部丢弃并累加DropCount */
-        {
-            int i;
-
-            for (i = 0; i < n; i++)
-            {
-                BspUartQueuePush(&G_Queue, Buf[i]);
-            }
         }
     }
 
@@ -177,6 +198,7 @@ UartRecvThread(void *arg)
 =                       解析线程
 =  职责: 从队列取字节喂状态机, 帧同步/CRC/统计/解析全在协议层
 ===========================================================*/
+
 static void *
 UartParseThread(void *arg)
 {
@@ -205,6 +227,233 @@ UartParseThread(void *arg)
     printf("UartParseThread Exit\r\n");
 
     return NULL;
+}
+
+/*===========================================================
+=                       功能1: 数据流统计模式
+===========================================================*/
+
+/** @brief 汇总: 报文帧间隔统计打印(帧数>=2) */
+static void StatPrintIntervals(unsigned int MsgId, const UartFrameStat_S *Stat)
+{
+    double Span = Stat->LastTs - Stat->FirstTs;
+
+    double AvgHz = (Span > 1e-6) ? (double)(Stat->Count - 1) / Span : 0.0;
+
+    double AvgIntMs = Stat->SumInt / (double)(Stat->Count - 1) * 1000.0;
+
+    printf("0x%02X: %llu 帧, 平均 %.2f Hz, 当前间隔 %.3f ms, "
+           "平均间隔 %.3f ms [min %.3f / max %.3f]\r\n",
+           MsgId, Stat->Count, AvgHz, Stat->LastIntMs,
+           AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs);
+}
+
+/** @brief 汇总: 报文时间戳Δt统计打印(有样本才打印) */
+static void StatPrintTsDelta(unsigned int MsgId, const UartTsDelta_S *Tsd)
+{
+    if ((Tsd == NULL) || (Tsd->Sample == 0))
+    {
+        return;
+    }
+
+    printf("0x%02X 时间戳Δt: 最新 %.3f ms, 平均 %.3f ms, "
+           "最小 %.3f ms, 最大 %.3f ms, 样本 %llu\r\n",
+           MsgId, Tsd->LastDeltaMs,
+           Tsd->SumDeltaMs / (double)Tsd->Sample,
+           Tsd->MinDeltaMs, Tsd->MaxDeltaMs, Tsd->Sample);
+}
+
+/**
+ * @brief 汇总: 单个报文的帧统计与Δt打印
+ */
+static void StatPrintOneMsg(unsigned int i)
+{
+    const UartFrameStat_S *Stat = BspUartProtocolGetStat(i);
+
+    unsigned int MsgId = BspUartProtocolGetMsgId(i);
+
+    const UartTsDelta_S *Tsd = BspUartProtocolGetTsDelta(i);
+
+    if ((Stat == NULL) || (Stat->Count == 0))
+    {
+        printf("0x%02X: 无数据\r\n", MsgId);
+
+        return;
+    }
+
+    if (Stat->Count == 1)
+    {
+        printf("0x%02X: %llu 帧(仅1帧)\r\n", MsgId, Stat->Count);
+
+        return;
+    }
+
+    StatPrintIntervals(MsgId, Stat);
+
+    StatPrintTsDelta(MsgId, Tsd);
+}
+
+/**
+ * @brief 汇总: 接收统计总览+逐报文统计
+ */
+static void StatPrintSummary(void)
+{
+    unsigned int i;
+
+    printf("\r\n=== 汇总(共 %.1fs) ===\r\n", NowSec() - G_StartSec);
+
+    printf("串口接收: %llu 字节, 状态机喂入: %llu, CRC通过帧: %llu, "
+           "CRC失败帧: %llu, 队列丢弃字节: %u\r\n",
+           G_RxBytes, BspUartProtocolGetFeedBytes(), G_FrameOk,
+           BspUartProtocolGetCrcFail(), G_Queue.DropCount);
+
+    for (i = 0; i < UART_MSG_NUM; i++)
+    {
+        StatPrintOneMsg(i);
+    }
+}
+
+/** @brief 周期打印: 到达间隔则刷新统计(终端模式回退重绘覆盖) */
+static void StatMaybePrint(double Now, double *pLastPrint, double PrintIv,
+                           int Tty, int *pFirstPrint)
+{
+    if ((Now - *pLastPrint) < PrintIv)
+    {
+        return;
+    }
+
+    if (Tty && (*pFirstPrint == 0))
+    {
+        /* 回退到统计块首行覆盖重绘(行数固定, 见UART_STAT_PRINT_LINES) */
+        printf("\033[%dA", UART_STAT_PRINT_LINES);
+    }
+
+    BspUartProtocolPrintStat(Now - G_StartSec, Tty);
+
+    *pLastPrint = Now;
+
+    *pFirstPrint = 0;
+}
+
+/**
+ * @brief 主循环: 周期刷新统计, 限时到或Ctrl-C退出
+ */
+static void StatRunLoop(int DurationSec, int Tty)
+{
+    double LastPrint = 0;
+
+    double PrintIv = Tty ? 1.0 : 5.0; /* 管道输出降频, 避免刷屏 */
+
+    int FirstPrint = 1;
+
+    while (G_Running)
+    {
+        double Now;
+
+        usleep(20000); /* 20ms粒度轮询 */
+
+        Now = NowSec();
+
+        StatMaybePrint(Now, &LastPrint, PrintIv, Tty, &FirstPrint);
+
+        /* 限时运行: 到时退出 */
+        if ((DurationSec > 0) && (Now - G_StartSec >= (double)DurationSec))
+        {
+            break;
+        }
+    }
+}
+
+/**
+ * @brief 创建接收/解析两个线程(失败返回-1)
+ */
+static int StatStartThreads(pthread_t *pRecv, pthread_t *pParse)
+{
+    if (pthread_create(pRecv, NULL, UartRecvThread, NULL) != 0)
+    {
+        printf("Create RecvThread Fail\r\n");
+
+        return -1;
+    }
+
+    if (pthread_create(pParse, NULL, UartParseThread, NULL) != 0)
+    {
+        printf("Create ParseThread Fail\r\n");
+
+        return -1;
+    }
+
+    pthread_detach(*pRecv);
+
+    pthread_detach(*pParse);
+
+    return 0;
+}
+
+/** @brief 统计模式初始化: 打开串口+初始化队列与起始时刻
+ *
+ * @return 0=成功 -1=串口打开失败
+ */
+static int StatInit(void)
+{
+    if (DrvSerialOpen(&G_Serial) != 0)
+    {
+        printf("Open Serial Fail\r\n");
+
+        return -1;
+    }
+
+    BspUartQueueInit(&G_Queue);
+
+    G_StartSec = NowSec();
+
+    G_LastRxSec = G_StartSec;
+
+    return 0;
+}
+
+/** @brief 统计模式收尾: 停止线程并打印汇总, 关闭串口 */
+static void StatFinish(void)
+{
+    G_Running = 0;
+
+    usleep(200000);
+
+    StatPrintSummary();
+
+    DrvSerialClose(&G_Serial);
+}
+
+/**
+ * @brief 功能1主体: 打开串口+线程+主循环+优雅退出汇总
+ *
+ * @return 0=正常 -1=失败
+ */
+static int RunStatMode(int DurationSec)
+{
+    pthread_t RecvThread;
+
+    pthread_t ParseThread;
+
+    int Tty = isatty(1);
+
+    if (StatInit() != 0)
+    {
+        return -1;
+    }
+
+    if (StatStartThreads(&RecvThread, &ParseThread) != 0)
+    {
+        DrvSerialClose(&G_Serial);
+
+        return -1;
+    }
+
+    StatRunLoop(DurationSec, Tty);
+
+    StatFinish();
+
+    return 0;
 }
 
 /*===========================================================
@@ -237,27 +486,17 @@ static void PrintUsage(const char *Prog)
     printf("      %s /dev/ttyUSB1 921600 3      (HEX验证仅安全组)\r\n", Prog);
 }
 
-int main(int argc, char *argv[])
+/**
+ * @brief 解析串口设备与波特率参数(argv[1]/argv[2])
+ *
+ * @return 0=成功 -1=参数非法
+ */
+static int ParseSerialArgs(int argc, char *argv[])
 {
-    pthread_t RecvThread;
-
-    pthread_t ParseThread;
-
-    int DurationSec = 0;
-
-    int Tty;
-
-    /* ---------- 参数解析 ---------- */
-    if ((argc > 1) && ((strcmp(argv[1], "-h") == 0) || (strcmp(argv[1], "--help") == 0)))
-    {
-        PrintUsage(argv[0]);
-
-        return 0;
-    }
-
     if (argc > 1)
     {
         strncpy(G_Serial.Dev, argv[1], sizeof(G_Serial.Dev) - 1);
+
         G_Serial.Dev[sizeof(G_Serial.Dev) - 1] = '\0';
     }
 
@@ -273,191 +512,86 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---------- 功能分发: 第3参数2/3=AT/HEX验证, 其余=持续秒数(兼容旧用法) ---------- */
+    return 0;
+}
+
+/**
+ * @brief 功能分发: 第3参数2/3=AT/HEX验证, 其余/缺省=持续秒数(兼容旧用法)
+ *
+ * @return 1=已执行验证(*pRet=功能返回值) 0=走数据流统计(*pDurationSec已填)
+ */
+static int DispatchFeature(int argc, char *argv[], int *pRet, int *pDurationSec)
+{
     if ((argc > 3) && (strcmp(argv[3], "2") == 0))
     {
-        return BspAtTestRun(G_Serial.Dev, G_Serial.Baud,
-                            (argc > 4) ? atoi(argv[4]) : 0);
+        *pRet = BspAtTestRun(G_Serial.Dev, G_Serial.Baud,
+                             (argc > 4) ? atoi(argv[4]) : 0);
+
+        return 1;
     }
 
     if ((argc > 3) && (strcmp(argv[3], "3") == 0))
     {
-        return BspHexTestRun(G_Serial.Dev, G_Serial.Baud,
-                             (argc > 4) ? atoi(argv[4]) : 0);
+        *pRet = BspHexTestRun(G_Serial.Dev, G_Serial.Baud,
+                              (argc > 4) ? atoi(argv[4]) : 0);
+
+        return 1;
     }
 
     if (argc > 3)
     {
-        DurationSec = atoi(argv[3]);
+        *pDurationSec = atoi(argv[3]);
 
-        if (DurationSec < 0)
+        if (*pDurationSec < 0)
         {
-            DurationSec = 0;
+            *pDurationSec = 0;
         }
     }
-
-    Tty = isatty(1);
-
-    signal(SIGINT, OnSignal);
-
-    signal(SIGTERM, OnSignal);
-
-    printf("=====================================\r\n");
-
-    printf(" Linux UART IMU Stat Start\r\n");
-
-    printf("=====================================\r\n");
-
-    printf("Version  : %s\r\n", G_Version);
-
-    printf("Dev      : %s\r\n", G_Serial.Dev);
-
-    printf("Baud     : %d 8N1\r\n", G_Serial.Baud);
-
-    printf("Duration : %s\r\n", (DurationSec > 0) ? "限时运行" : "直到Ctrl-C");
-
-    /* ---------- 打开串口 ---------- */
-    if (DrvSerialOpen(&G_Serial) != 0)
-    {
-        printf("Open Serial Fail\r\n");
-
-        return -1;
-    }
-
-    BspUartQueueInit(&G_Queue);
-
-    G_StartSec = NowSec();
-
-    G_LastRxSec = G_StartSec;
-
-    /* ---------- 创建线程 ---------- */
-    if (pthread_create(&RecvThread, NULL, UartRecvThread, NULL) != 0)
-    {
-        printf("Create RecvThread Fail\r\n");
-
-        DrvSerialClose(&G_Serial);
-
-        return -1;
-    }
-
-    if (pthread_create(&ParseThread, NULL, UartParseThread, NULL) != 0)
-    {
-        printf("Create ParseThread Fail\r\n");
-
-        DrvSerialClose(&G_Serial);
-
-        return -1;
-    }
-
-    pthread_detach(RecvThread);
-
-    pthread_detach(ParseThread);
-
-    /* ---------- 主循环: 每秒刷新统计 ---------- */
-    {
-        double LastPrint = 0;
-
-        double PrintIv = Tty ? 1.0 : 5.0; /* 管道输出降频, 避免刷屏 */
-
-        int FirstPrint = 1;
-
-        while (G_Running)
-        {
-            double Now = NowSec();
-
-            usleep(20000); /* 20ms粒度轮询 */
-
-            Now = NowSec();
-
-            if (Now - LastPrint >= PrintIv)
-            {
-                if (Tty && !FirstPrint)
-                {
-                    /* 回退到统计块首行覆盖重绘(行数固定, 见UART_STAT_PRINT_LINES) */
-                    printf("\033[%dA", UART_STAT_PRINT_LINES);
-                }
-
-                BspUartProtocolPrintStat(Now - G_StartSec, Tty);
-
-                LastPrint = Now;
-
-                FirstPrint = 0;
-            }
-
-            /* 限时运行: 到时退出 */
-            if ((DurationSec > 0) && (Now - G_StartSec >= (double)DurationSec))
-            {
-                break;
-            }
-        }
-    }
-
-    /* ---------- 优雅退出 ---------- */
-    G_Running = 0;
-
-    usleep(200000);
-
-    printf("\r\n=== 汇总(共 %.1fs) ===\r\n", NowSec() - G_StartSec);
-
-    printf("串口接收: %llu 字节, 状态机喂入: %llu, CRC通过帧: %llu, "
-           "CRC失败帧: %llu, 队列丢弃字节: %u\r\n",
-           G_RxBytes, BspUartProtocolGetFeedBytes(), G_FrameOk,
-           BspUartProtocolGetCrcFail(), G_Queue.DropCount);
-
-    {
-        unsigned int i;
-
-        for (i = 0; i < UART_MSG_NUM; i++)
-        {
-            const UartFrameStat_S *Stat = BspUartProtocolGetStat(i);
-
-            unsigned int MsgId = BspUartProtocolGetMsgId(i);
-
-            if ((Stat == NULL) || (Stat->Count == 0))
-            {
-                printf("0x%02X: 无数据\r\n", MsgId);
-
-                continue;
-            }
-
-            if (Stat->Count == 1)
-            {
-                printf("0x%02X: %llu 帧(仅1帧)\r\n", MsgId, Stat->Count);
-
-                continue;
-            }
-
-            {
-                double Span = Stat->LastTs - Stat->FirstTs;
-
-                double AvgHz = (Span > 1e-6) ? (double)(Stat->Count - 1) / Span : 0.0;
-
-                double AvgIntMs = Stat->SumInt / (double)(Stat->Count - 1) * 1000.0;
-
-                printf("0x%02X: %llu 帧, 平均 %.2f Hz, 当前间隔 %.3f ms, "
-                       "平均间隔 %.3f ms [min %.3f / max %.3f]\r\n",
-                       MsgId, Stat->Count, AvgHz, Stat->LastIntMs,
-                       AvgIntMs, Stat->MinIntMs, Stat->MaxIntMs);
-            }
-
-            /* 带时间戳的包补Δt汇总 */
-            {
-                const UartTsDelta_S *Tsd = BspUartProtocolGetTsDelta(i);
-
-                if ((Tsd != NULL) && (Tsd->Sample > 0))
-                {
-                    printf("0x%02X 时间戳Δt: 最新 %.3f ms, 平均 %.3f ms, "
-                           "最小 %.3f ms, 最大 %.3f ms, 样本 %llu\r\n",
-                           MsgId, Tsd->LastDeltaMs,
-                           Tsd->SumDeltaMs / (double)Tsd->Sample,
-                           Tsd->MinDeltaMs, Tsd->MaxDeltaMs,
-                           Tsd->Sample);
-                }
-            }
-        }
-    }
-
-    DrvSerialClose(&G_Serial);
 
     return 0;
+}
+
+/** @brief 打印统计模式启动banner */
+static void PrintStatBanner(int DurationSec)
+{
+    printf("=====================================\r\n");
+    printf(" Linux UART IMU Stat Start\r\n");
+    printf("=====================================\r\n");
+    printf("Version  : %s\r\n", G_Version);
+    printf("Dev      : %s\r\n", G_Serial.Dev);
+    printf("Baud     : %d 8N1\r\n", G_Serial.Baud);
+    printf("Duration : %s\r\n", (DurationSec > 0) ? "限时运行" : "直到Ctrl-C");
+}
+
+int main(int argc, char *argv[])
+{
+    int DurationSec = 0;
+
+    int Ret = 0;
+
+    /* ---------- 参数解析 ---------- */
+    if ((argc > 1) && ((strcmp(argv[1], "-h") == 0) || (strcmp(argv[1], "--help") == 0)))
+    {
+        PrintUsage(argv[0]);
+
+        return 0;
+    }
+
+    if (ParseSerialArgs(argc, argv) != 0)
+    {
+        return -1;
+    }
+
+    /* ---------- 功能分发: 2=AT验证 3=HEX验证, 其余=持续秒数 ---------- */
+    if (DispatchFeature(argc, argv, &Ret, &DurationSec) != 0)
+    {
+        return Ret;
+    }
+
+    signal(SIGINT, OnSignal);
+    signal(SIGTERM, OnSignal);
+
+    PrintStatBanner(DurationSec);
+
+    return RunStatMode(DurationSec);
 }
