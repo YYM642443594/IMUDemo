@@ -2,7 +2,7 @@
  *******************************************************************************
  * @file    bsp_can_test.c
  * @author  杨镒铭
- * @version V1.0.0
+ * @version V1.1.0
  * @date    2026-10-21
  * @brief   志翔IMU CAN交互协议逐指令验证器(由main.c统一入口调用, 单程序整合版)
  *
@@ -13,9 +13,14 @@
  *   - 操作符: 0x00查询 / 0x01写RAM(掉电不保存) / 0x02写FLASH(掉电保存)
  *   - 查询类: 下发查询帧 -> 按文档应答格式校验值域并提取关键值
  *   - 动作类: 下发写入帧 -> 应答8字节全0即通过(固件写操作Playload全0)
- *   - 分组执行: 安全组(纯查询+无持久副作用动作)/风险组(写RAM改配置)
+ *   - 分组执行: 安全组(纯查询+无持久副作用动作)/风险组(写RAM改配置)/
+ *     异常组(非法输入鲁棒性, 与风险组同开关)
  *   - 风险组验证后自动还原: 依据安全组查询缓存构造还原帧(还原不计分)
- *   - 数据流容错: 内核过滤器只收0x100~0x115, 0x091~0x098推送帧不进用户态
+ *   - 异常组(预期均以固件bsp_parse.c实际行为为准):
+ *     无效操作符静默类(0x100/0x105无应答)/无效应答类(0x101等末尾无条件全0应答)/
+ *     未知ID(0x116越界分发表无应答)/非法档位回落(0x101非法档固件回落50Hz档5)/
+ *     非法值直写确认(0x102坐标系/0x109 PPS模式固件无值域校验直写, 记录行为后还原)
+ *   - 数据流容错: 内核过滤器只收0x100~0x115(0x110~0x117并入), 推送帧不进用户态
  *   - 输出为安静模式: 每条用例一行, 结束后输出汇总表
  *   - 代码风格: 单函数体不超过30行(约20行为宜), 超出即按职责拆分
  *
@@ -33,6 +38,7 @@
  * @par 修改日志
  * <table>
  * <tr><th>版本<th>日期<th>作者<th>描述
+ * <tr><td>V1.1.0<td>2026-10-21<td>杨镒铭<td>新增异常组8条(与风险组同开关, 预期以固件实际行为为准): 无效操作符静默(0x100/0x105/0x115非法类型/未知ID0x116均无应答), 无效操作符无效应答(0x101回全0), 非法频率档回落50Hz验证, 非法坐标系/PPS模式直写行为确认+还原; 新增写查还原三步用例类型CN_T_ABN_WQ
  * <tr><td>V1.0.0<td>2026-10-21<td>杨镒铭<td>创建: 参照串口HEX验证器(bsp_hex_test.c)架构实现CAN版: 16个ID共24条用例(安全组15查询+YAW归零, 风险组RAM写入7条自动还原, 复位置表末), 查询校验键->函数分发表, 缓存驱动还原, 内核过滤器隔离数据流
  *   </table>
  *******************************************************************************
@@ -84,19 +90,23 @@
 #define CAN_ID_UART_CTRL  0x113     /* UART开关控制 */
 #define CAN_ID_SIMP_PUSH  0x114     /* CAN数据流输出状态(数据精简版) */
 #define CAN_ID_SCALE      0x115     /* 加/角速度量程配置(文档缺失,固件实现) */
+#define CAN_ID_UNKNOWN    0x116     /* 分发表外的未知ID(异常组用, 固件无应答) */
 
 /** @brief 用例类型 */
 typedef enum
 {
     CN_T_QUERY = 0,   /* 查询类: 校验应答格式/值域 */
-    CN_T_ACTION        /* 动作类: 应答8字节全0即过 */
+    CN_T_ACTION,      /* 动作类: 应答8字节全0即过 */
+    CN_T_NOANS,       /* 异常类: 预期无应答(超时即通过) */
+    CN_T_ABN_WQ       /* 异常类: 非法值写入->行为查询->还原 三步一体 */
 } CnCaseType_E;
 
 /** @brief 风险等级 */
 typedef enum
 {
     CN_G_SAFE = 0,    /* 安全组: 只读或无持久副作用 */
-    CN_G_RISK         /* 风险组: 写RAM改配置, 验证后自动还原 */
+    CN_G_RISK,        /* 风险组: 写RAM改配置, 验证后自动还原 */
+    CN_G_ABN          /* 异常组: 非法输入鲁棒性, 与风险组同开关 */
 } CnGroup_E;
 
 /** @brief 发送参数构造方式 */
@@ -136,6 +146,7 @@ typedef struct
     CnSetKind_E SetKind;         /* 发送参数构造方式 */
     unsigned char Data[8];       /* 固定发送参数(data[1..7]区) */
     CnRestoreKind_E Restore;     /* 通过后的还原方式 */
+    unsigned char QData[8];      /* ABN_WQ第二步查询参数(data[1..7]区) */
 } CnCase_S;
 
 /** @brief 单条用例执行结果 */
@@ -222,6 +233,19 @@ static CnCase_S G_Cases[] =
     { CAN_ID_PPS,       CAN_OP_RAM, CN_T_ACTION, CN_G_RISK, "PPS开关取反",          NULL, CN_S_PPS_INV,    { 0 },           CN_R_PPS },
     { CAN_ID_SIMP_PUSH, CAN_OP_RAM, CN_T_ACTION, CN_G_RISK, "精简流开关取反",       NULL, CN_S_SIMP_INV,   { 0 },           CN_R_SIMP },
     { CAN_ID_ZERO_CAL,  CAN_OP_RAM, CN_T_ACTION, CN_G_RISK, "零偏校准开启(需静止)", NULL, CN_S_FIXED, { 0x01 },             CN_R_ZERO_OFF },
+
+    /* ---------- 异常组: 非法输入鲁棒性(与风险组同开关, 预期以固件实际行为为准) ---------- */
+    /* 无效应答静默类: 固件仅认有效操作符/类型/ID, 均无应答(超时即通过) */
+    { CAN_ID_VERSION,   0x03,       CN_T_NOANS,  CN_G_ABN, "非法操作符版本查询",     NULL, CN_S_FIXED, { 0 },                CN_R_NONE },
+    { CAN_ID_SN_LO,     0x01,       CN_T_NOANS,  CN_G_ABN, "SN查询发写操作符",       NULL, CN_S_FIXED, { 0 },                CN_R_NONE },
+    { CAN_ID_SCALE,     CAN_OP_QUERY, CN_T_NOANS, CN_G_ABN, "量程查询非法类型",      NULL, CN_S_FIXED, { 0x03 },             CN_R_NONE },
+    { CAN_ID_UNKNOWN,   CAN_OP_QUERY, CN_T_NOANS, CN_G_ABN, "未知指令ID查询",        NULL, CN_S_FIXED, { 0 },                CN_R_NONE },
+    /* 无效操作符无效应答类: 固件0x101末尾无条件应答, 非法操作符回全0 */
+    { CAN_ID_PUSH_FRE,  0x05,       CN_T_ACTION, CN_G_ABN, "非法操作符频率",         NULL, CN_S_FIXED, { 0 },                CN_R_NONE },
+    /* 非法值写入->固件行为查询->还原 三步一体(ABN_WQ, QData=查询参数) */
+    { CAN_ID_PUSH_FRE,  CAN_OP_RAM, CN_T_ABN_WQ, CN_G_ABN, "非法频率档回落验证",     "freq_fallback", CN_S_FIXED, { 0x0A },       CN_R_FREQ,   { 0 } },
+    { CAN_ID_COORD,     CAN_OP_RAM, CN_T_ABN_WQ, CN_G_ABN, "非法坐标系直写确认",     "coord_raw837",  CN_S_FIXED, { 0x45, 0x03 }, CN_R_COORD,  { 0 } },
+    { CAN_ID_PPS,       CAN_OP_RAM, CN_T_ABN_WQ, CN_G_ABN, "非法PPS模式直写确认",    "pps_raw5",      CN_S_FIXED, { 0x05, 0x00 }, CN_R_PPS,    { 0 } },
 
     /* 复位重启: RAM档应答后设备复位断流数秒, 固定放用例表末尾最后执行 */
     { CAN_ID_RESET,     CAN_OP_RAM, CN_T_ACTION, CN_G_RISK, "复位重启",        NULL,       CN_S_FIXED, { 0x01 },             CN_R_NONE },
@@ -677,7 +701,8 @@ static int CkUartSw(const unsigned char *pD, char *pVals, int ValsSize,
         return 0;
     }
 
-    snprintf(pVals, (size_t)ValsSize, "UART%u:%s", WantUart, pD[1] ? "开" : "关");
+    snprintf(pVals, (size_t)ValsSize, "UART%u:%s",
+             (unsigned int)(WantUart - 1), pD[1] ? "开" : "关");
 
     return 1;
 }
@@ -749,6 +774,53 @@ static int CkGyroScale(const unsigned char *pD, char *pVals, int ValsSize, char 
     return CkScale(pD, pVals, ValsSize, pNote, NoteSize, 0);
 }
 
+/** @brief 异常: 非法频率档(0x0A)写入后固件回落50Hz档5(BspDataPushFreCodeToEnum非法码回落) */
+static int CkFreqFallback(const unsigned char *pD, char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    if (pD[0] != 5)
+    {
+        snprintf(pNote, (size_t)NoteSize, "非法档后固件回档%u(预期回落5=50Hz)", pD[0]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "非法档0x0A回落档5(50Hz), 符合固件约定");
+
+    return 1;
+}
+
+/** @brief 异常: 非法坐标系837(0x0345)写入后固件无值域校验直写(记录行为, 未来加校验则FAIL提示行为变化) */
+static int CkCoordRaw(const unsigned char *pD, char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    unsigned short v = (unsigned short)(pD[0] | ((unsigned short)pD[1] << 8));
+
+    if (v != 837)
+    {
+        snprintf(pNote, (size_t)NoteSize, "固件已拦截非法值(回%u, 原837直写)", v);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "固件未拦截直写837(无值域校验), 已还原");
+
+    return 1;
+}
+
+/** @brief 异常: 非法PPS模式5写入后固件无值域校验直写(记录行为) */
+static int CkPpsRaw(const unsigned char *pD, char *pVals, int ValsSize, char *pNote, int NoteSize)
+{
+    if (pD[0] != 5)
+    {
+        snprintf(pNote, (size_t)NoteSize, "固件已拦截非法模式(回%u, 原5直写)", pD[0]);
+
+        return 0;
+    }
+
+    snprintf(pVals, (size_t)ValsSize, "固件未拦截直写模式5(无值域校验), 已还原");
+
+    return 1;
+}
+
 /** @brief 校验键->校验函数分发表 */
 typedef struct
 {
@@ -773,6 +845,9 @@ static const CnCheckMap_S G_CheckMap[] =
     { "simp",     CkSimp },
     { "accscale", CkAccScale },
     { "gyroscale", CkGyroScale },
+    { "freq_fallback", CkFreqFallback },
+    { "coord_raw837",  CkCoordRaw },
+    { "pps_raw5",      CkPpsRaw },
 };
 
 /**
@@ -947,15 +1022,21 @@ static int CnSendRecv(DrvSocketCan_S *pDrv, const CnCase_S *pC,
 /**
  * @brief 执行单条用例(安静模式, 不打印过程)
  */
+static void RunNoAnsCase(DrvSocketCan_S *pDrv, CnCase_S *pC, CnResult_S *pRes);
+
+static void RunAbnWqCase(DrvSocketCan_S *pDrv, CnCase_S *pC, CnResult_S *pRes);
+
 static void RunCase(DrvSocketCan_S *pDrv, CnCase_S *pC, CnResult_S *pRes)
 {
     unsigned char Resp[CAN_TEST_DLC];
 
     pRes->Vals[0] = '\0';
-
     pRes->Note[0] = '\0';
-
     pRes->Done = 1;
+
+    if (pC->Type == CN_T_ABN_WQ) { RunAbnWqCase(pDrv, pC, pRes); return; }
+
+    if (pC->Type == CN_T_NOANS) { RunNoAnsCase(pDrv, pC, pRes); return; }
 
     if (CnSendRecv(pDrv, pC, pRes, Resp) == 0)
     {
@@ -970,6 +1051,35 @@ static void RunCase(DrvSocketCan_S *pDrv, CnCase_S *pC, CnResult_S *pRes)
     else
     {
         pRes->Pass = CnCheckAction(Resp, pRes->Note, (int)sizeof(pRes->Note));
+    }
+}
+
+/**
+ * @brief 异常用例: 预期无应答(固件静默丢弃无效输入, 超时即通过)
+ */
+static void RunNoAnsCase(DrvSocketCan_S *pDrv, CnCase_S *pC, CnResult_S *pRes)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    int n = CanTransact(pDrv, pC->Id, pC->Op, pC->Data, Resp);
+
+    if (n == 0)
+    {
+        pRes->Pass = 1;
+
+        snprintf(pRes->Vals, sizeof(pRes->Vals), "无应答(符合固件预期)");
+
+        return;
+    }
+
+    if (n == -1)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "发送失败");
+    }
+    else
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note),
+                 "意外应答:%02X%02X%02X%02X", Resp[0], Resp[1], Resp[2], Resp[3]);
     }
 }
 
@@ -1024,6 +1134,57 @@ static void CnDoRestorePrint(DrvSocketCan_S *pDrv, const CnCase_S *pC)
     fflush(stdout);
 }
 
+/** @brief ABN_WQ第一步: 写非法值, 固件应答全0 */
+static int AbnWqWrite(DrvSocketCan_S *pDrv, const CnCase_S *pC, CnResult_S *pRes)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    int n = CanTransact(pDrv, pC->Id, pC->Op, pC->Data, Resp);
+
+    if (n != 1)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note),
+                 (n == -1) ? "写入发送失败" : "写入无应答");
+
+        return 0;
+    }
+
+    return CnCheckAction(Resp, pRes->Note, (int)sizeof(pRes->Note));
+}
+
+/** @brief ABN_WQ第二步: 查询固件行为, 按Expect键校验 */
+static int AbnWqQuery(DrvSocketCan_S *pDrv, const CnCase_S *pC, CnResult_S *pRes)
+{
+    unsigned char Resp[CAN_TEST_DLC];
+
+    int n = CanTransact(pDrv, pC->Id, CAN_OP_QUERY, pC->QData, Resp);
+
+    if (n != 1)
+    {
+        snprintf(pRes->Note, sizeof(pRes->Note), "行为查询无应答");
+
+        return 0;
+    }
+
+    pRes->Pass = CheckQuery(pC, Resp, pRes->Vals, (int)sizeof(pRes->Vals),
+                            pRes->Note, (int)sizeof(pRes->Note));
+
+    return pRes->Pass;
+}
+
+/**
+ * @brief 异常用例: 非法值写入->固件行为查询 两步(还原由外层统一执行)
+ */
+static void RunAbnWqCase(DrvSocketCan_S *pDrv, CnCase_S *pC, CnResult_S *pRes)
+{
+    if (AbnWqWrite(pDrv, pC, pRes) == 0)
+    {
+        return;
+    }
+
+    (void)AbnWqQuery(pDrv, pC, pRes);
+}
+
 /*===========================================================
 =                       打印与主流程
 ===========================================================*/
@@ -1058,13 +1219,13 @@ static void CnRunOneCase(DrvSocketCan_S *pDrv, unsigned int i, int RunRisk)
 {
     CnCase_S *pCase = &G_Cases[i];
 
-    if ((pCase->Group == CN_G_RISK) && (RunRisk == 0))
+    if ((pCase->Group != CN_G_SAFE) && (RunRisk == 0))
     {
         G_Result[i].Skip = 1;
 
         CnPrintHead(i, pCase->Name);
 
-        printf("SKIP  风险组未启用\n");
+        printf("SKIP  风险/异常组未启用\n");
 
         return;
     }
@@ -1079,7 +1240,11 @@ static void CnRunOneCase(DrvSocketCan_S *pDrv, unsigned int i, int RunRisk)
 
     PrintCaseResult(pCase, &G_Result[i]);
 
-    if (NeedRestore(pCase, &G_Result[i]) != 0)
+    if (pCase->Type == CN_T_ABN_WQ)
+    {
+        CnDoRestorePrint(pDrv, pCase); /* 异常写查后无条件还原, 保设备状态 */
+    }
+    else if (NeedRestore(pCase, &G_Result[i]) != 0)
     {
         CnDoRestorePrint(pDrv, pCase);
     }
@@ -1115,7 +1280,7 @@ static void CnPrintSummary(int RunRisk, int *pPass, int *pFail, int *pSkip)
     printf("============================================================\n");
 
     printf(" CAN指令验证汇总(%s): 共%u条 PASS=%d FAIL=%d SKIP=%d\n",
-           RunRisk ? "安全组+风险组" : "仅安全组",
+           RunRisk ? "安全+风险+异常组" : "仅安全组",
            (unsigned int)CASE_NUM, *pPass, *pFail, *pSkip);
 
     printf("============================================================\n");
@@ -1146,8 +1311,8 @@ static void CnPrintFails(void)
  */
 static int CnOpenDevice(DrvSocketCan_S *pDrv, const char *pIfName, int RunRisk)
 {
-    printf("===== CAN指令验证器 V1.0.0 (接口 %s, %s) =====\n",
-           pIfName, RunRisk ? "安全组+风险组" : "仅安全组");
+    printf("===== CAN指令验证器 V1.1.0 (接口 %s, %s) =====\n",
+           pIfName, RunRisk ? "安全+风险+异常组" : "仅安全组");
 
     if (CanTestOpen(pDrv, pIfName) != 0)
     {
