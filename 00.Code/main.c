@@ -64,15 +64,15 @@
 #include <pthread.h>
 #include <time.h>
 
-#include "drv_serial.h"
-#include "bsp_uart_queue.h"
-#include "bsp_uart_protocol.h"
-#include "bsp_at_test.h"
-#include "bsp_hex_test.h"
-#include "drv_socketcan.h"    /* SocketCAN驱动层: 打开/收发/关闭 */
-#include "bsp_can_queue.h"    /* 帧级环形队列: 衔接收发两个线程 */
-#include "bsp_can_protocol.h" /* 协议层: 过滤器/推送开关/解析/统计 */
-#include "bsp_can_test.h"     /* CAN指令验证器: 功能2入口 */
+#include "uart/drv_serial.h"
+#include "uart/bsp_uart_queue.h"
+#include "uart/bsp_uart_protocol.h"
+#include "uart/bsp_at_test.h"
+#include "uart/bsp_hex_test.h"
+#include "can/drv_socketcan.h"    /* SocketCAN驱动层: 打开/收发/关闭 */
+#include "can/bsp_can_queue.h"    /* 帧级环形队列: 衔接收发两个线程 */
+#include "can/bsp_can_protocol.h" /* 协议层: 过滤器/推送开关/解析/统计 */
+#include "can/bsp_can_test.h"     /* CAN指令验证器: 功能2入口 */
 
 /*===========================================================
 =                       全局对象

@@ -104,10 +104,10 @@ fi
 echo "== Build =="
 gcc -O2 -Wall -o "$DIR/imu_test" \
     "$DIR/main.c" \
-    "$DIR/drv_serial.c" "$DIR/bsp_uart_queue.c" "$DIR/bsp_uart_protocol.c" \
-    "$DIR/bsp_at_test.c" "$DIR/bsp_hex_test.c" \
-    "$DIR/drv_socketcan.c" "$DIR/bsp_can_queue.c" "$DIR/bsp_can_protocol.c" \
-    "$DIR/bsp_can_test.c" \
+    "$DIR/uart/drv_serial.c" "$DIR/uart/bsp_uart_queue.c" "$DIR/uart/bsp_uart_protocol.c" \
+    "$DIR/uart/bsp_at_test.c" "$DIR/uart/bsp_hex_test.c" \
+    "$DIR/can/drv_socketcan.c" "$DIR/can/bsp_can_queue.c" "$DIR/can/bsp_can_protocol.c" \
+    "$DIR/can/bsp_can_test.c" \
     -lpthread || { echo "Build imu_test Fail"; exit 1; }
 echo "Build OK (imu_test: UART 1统计/2AT/3HEX + CAN 统计/指令验证)"
 

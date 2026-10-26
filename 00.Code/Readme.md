@@ -56,15 +56,17 @@
 ```
 00.Code/
 ├── main.c                 # 统一入口：按设备名判别传输层并分发功能 + 双统计主循环、线程管理
-├── drv_serial.c/h         # UART串口驱动模块（termios，8N1，低延迟）
-├── bsp_uart_queue.c/h     # UART字节流SPSC环形队列模块（4KB）
-├── bsp_uart_protocol.c/h  # UART协议层：帧同步/CRC16/统计/数据包1~4解析
-├── bsp_at_test.c/h        # AT指令逐条验证器（查询/动作分组，配置自动还原）
-├── bsp_hex_test.c/h       # HEX交互协议逐报文验证器（3.2章全ID覆盖，RAM配置自动还原）
-├── drv_socketcan.c/h      # SocketCAN驱动模块
-├── bsp_can_queue.c/h      # CAN帧级环形队列模块
-├── bsp_can_protocol.c/h   # CAN协议层：过滤器/0x103按需开启推送/解析/统计
-├── bsp_can_test.c/h       # CAN指令验证器（逐指令实测+自动还原+压力模式）
+├── uart/                  # UART传输层（5模块）
+│   ├── drv_serial.c/h     # 串口驱动模块（termios，8N1，低延迟）
+│   ├── bsp_uart_queue.c/h # 字节流SPSC环形队列模块（4KB）
+│   ├── bsp_uart_protocol.c/h # 协议层：帧同步/CRC16/统计/数据包1~4解析
+│   ├── bsp_at_test.c/h    # AT指令逐条验证器（查询/动作分组，配置自动还原）
+│   └── bsp_hex_test.c/h   # HEX交互协议逐报文验证器（3.2章全ID覆盖，RAM配置自动还原）
+├── can/                   # SocketCAN传输层（4模块）
+│   ├── drv_socketcan.c/h  # SocketCAN驱动模块
+│   ├── bsp_can_queue.c/h  # CAN帧级环形队列模块
+│   ├── bsp_can_protocol.c/h # 协议层：过滤器/0x103按需开启推送/解析/统计
+│   └── bsp_can_test.c/h   # CAN指令验证器（逐指令实测+自动还原+压力模式）
 ├── run.sh                 # 一键编译运行脚本（双传输统一：判别传输层+功能菜单）
 ├── Readme.md              # 项目说明文档
 └── .gitignore             # 忽略编译产物
@@ -98,9 +100,11 @@
 ./run.sh can0 10
 
 # 手动编译(单程序, 双传输全部源文件)
-gcc -O2 -Wall -o imu_test main.c drv_serial.c bsp_uart_queue.c bsp_uart_protocol.c \
-    bsp_at_test.c bsp_hex_test.c drv_socketcan.c bsp_can_queue.c bsp_can_protocol.c \
-    bsp_can_test.c -lpthread
+gcc -O2 -Wall -o imu_test main.c \
+    uart/drv_serial.c uart/bsp_uart_queue.c uart/bsp_uart_protocol.c \
+    uart/bsp_at_test.c uart/bsp_hex_test.c \
+    can/drv_socketcan.c can/bsp_can_queue.c can/bsp_can_protocol.c \
+    can/bsp_can_test.c -lpthread
 ```
 
 统一用法：`./imu_test [设备名] [功能] [功能参数]`（设备名 can 开头=SocketCAN，否则=UART 串口）
@@ -315,3 +319,4 @@ UART 数据包2/3/4 与 CAN 0x091 载荷均含设备内部时间戳（uint64，u
 ### 合并
 
 29. 版本：V2.0.0（2026-10-26）—— 合并 `feature/LinuxCanTestVerifDemo`：单程序 `imu_test` 双传输层统一入口（UART+SocketCAN），按设备名前缀 `can` 判别传输层并分发（CAN 功能号在 argv[2]，UART 波特率在 argv[2]）；run.sh 统一为单目标编译+传输层判别（UART/CAN/交互选择）；CAN 统计主循环由 main 内联拆分为 ≤30 行小函数；删除历史遗留 `libproto.so`；UART/CAN 版本史合并入本表
+30. 版本：V2.0.0（2026-10-26）—— 目录重组（无功能变更）：源码按传输层分目录 `uart/`（5模块）与 `can/`（4模块），main.c/run.sh/Readme.md/.gitignore 留在根；main.c include 与 run.sh 编译路径同步加目录前缀
